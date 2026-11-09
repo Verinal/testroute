@@ -2,22 +2,26 @@
 
 测试编排 Skill：路线规划、用例生成与标准化归档——七层标准测试链路、全流程证据链（trace/video/截图）、API 端点 × 深度覆盖硬门禁、案例卡与防伪封章报告。
 
-引擎在工具、引导在 Skill，零依赖（纯 Node ≥18，无需 npm install）。**本仓库 root 即 skill，clone 即装。**
+引擎在工具、引导在 Skill，零依赖（纯 Node ≥18，无需 npm install）。**本仓库根目录就是 skill 本体，clone 即用。**
 
 ## 安装
 
-把本仓库 clone 进宿主的 skill 目录即完成安装：
+下面用 `<skill目录>` 指代你的编辑器/宿主存放 skill 的目录（各宿主的常见取值见下表）。把本仓库 clone 为 `<skill目录>/testroute` 即完成安装：
 
 ```bash
-# Windows（Git Bash）
-git clone https://github.com/Verinal/testroute.git ~/.zcode/skills/testroute
-# Windows（PowerShell / cmd）
-git clone https://github.com/Verinal/testroute.git "%USERPROFILE%\.zcode\skills\testroute"
-# macOS / Linux
-git clone https://github.com/Verinal/testroute.git ~/.zcode/skills/testroute
+git clone https://github.com/Verinal/testroute.git <skill目录>/testroute
 ```
 
-其他宿主同理：Cursor 用 `~/.cursor/skills/testroute`，项目级安装放 `<项目>/.claude/skills/testroute` 等任意 skill 目录。
+`<skill目录>` 的常见取值：
+
+| 宿主 | `<skill目录>` 参考取值 |
+| --- | --- |
+| ZCode | `~/.zcode/skills`（项目级用 `<项目>/.zcode/skills`） |
+| Cursor | `~/.cursor/skills` |
+| Claude Code | `<项目>/.claude/skills` |
+| 其他宿主 | 任意固定路径即可，让 LLM 知道路径；不支持 skill 机制的宿主，把 SKILL.md 正文贴进系统提示/规则文件（如 `.cursor/rules`）同样生效 |
+
+> 提示：`~` 代表当前用户主目录，Windows 下即 `C:\Users\<用户名>`。
 
 ## 使用
 
@@ -31,7 +35,7 @@ git clone https://github.com/Verinal/testroute.git ~/.zcode/skills/testroute
 ## 更新
 
 ```bash
-git -C ~/.zcode/skills/testroute pull
+git -C <skill目录>/testroute pull
 ```
 
 ## 说明
