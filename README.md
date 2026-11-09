@@ -4,6 +4,8 @@
 
 引擎在工具、引导在 Skill，零依赖（纯 Node ≥18，无需 npm install）。**本仓库根目录就是 skill 本体，clone 即用。**
 
+> **为什么叫 TestRoute？** 这里的 route 指「测试路线」——先规划测什么、按什么顺序测，再据此生成用例并归档；与 API 路由（routing）无关。
+
 ## 安装
 
 下面用 `<skill目录>` 指代你的编辑器/宿主存放 skill 的目录（各宿主的常见取值见下表）。把本仓库 clone 为 `<skill目录>/testroute` 即完成安装：
