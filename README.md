@@ -16,9 +16,9 @@ git clone https://github.com/Verinal/testroute.git <skill目录>/testroute
 
 | 宿主 | `<skill目录>` 参考取值 |
 | --- | --- |
-| ZCode | `~/.zcode/skills`（项目级用 `<项目>/.zcode/skills`） |
-| Cursor | `~/.cursor/skills` |
 | Claude Code | `<项目>/.claude/skills` |
+| Cursor | `~/.cursor/skills` |
+| ZCode | `~/.zcode/skills`（项目级用 `<项目>/.zcode/skills`） |
 | 其他宿主 | 任意固定路径即可，让 LLM 知道路径；不支持 skill 机制的宿主，把 SKILL.md 正文贴进系统提示/规则文件（如 `.cursor/rules`）同样生效 |
 
 > 提示：`~` 代表当前用户主目录，Windows 下即 `C:\Users\<用户名>`。
