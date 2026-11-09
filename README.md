@@ -40,6 +40,5 @@ git -C <skill目录>/testroute pull
 
 ## 说明
 
-- 设计文档、609 项自检、示例项目在开发仓：https://github.com/Verinal/testroute-dev
-- 本仓库由开发仓 `scripts/publish-skill.mjs` 自动发布（build + 自检门禁全部通过才推送），请勿手改
+- 本仓库由自动化流程发布（build + 609 项自检门禁全部通过才推送），请勿手改
 - License: MIT
