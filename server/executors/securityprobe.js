@@ -12,7 +12,7 @@ const PER_REQUEST_TIMEOUT_MS = 12000;
 const MAX_TOTAL_REQUESTS = 800;
 const DISCLOSURE_MAX_ENDPOINTS = 100;
 
-// 冪等/会话类端点：未认证调用返回 2xx 属常见设计（登出刷新令牌），不做未认证/伪造探测（避免误报）
+// 幂等/会话类端点：未认证调用返回 2xx 属常见设计（登出刷新令牌），不做未认证/伪造探测（避免误报）
 const IDEMPOTENT_AUTH_RE = /\/(logout|signout|refresh|revoke)(\/|$)/i;
 // 登录/注册类端点：注入与限流探测的目标
 const AUTH_ENTRY_RE = /(login|signin|register|signup|auth\/token|session|password)/i;

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// TestRoute 可攜 CLI 入口——与 server/index.js（MCP stdio）共用同一套工具层，
+// TestRoute 可携 CLI 入口——与 server/index.js（MCP stdio）共用同一套工具层，
 // 让宿主不经 MCP 注册、直接用 Bash 调用 13 个测试领域工具。
 // 用法:
 //   node cli.js <tool> [--root <项目根>] [--args '<json>' | --args @<args.json>] [--list]
@@ -98,7 +98,7 @@ async function main() {
 
 const selfDir = path.dirname(fileURLToPath(import.meta.url));
 if (!fs.existsSync(path.join(selfDir, 'server', 'tools.js'))) {
-  die(`可攜包不完整：缺 ${path.join(selfDir, 'server', 'tools.js')}\n请重新构建（仓库内 node scripts/build-skill.mjs）或复制完整目录。`);
+  die(`可携包不完整：缺 ${path.join(selfDir, 'server', 'tools.js')}\n请重新构建（仓库内 node scripts/build-skill.mjs）或复制完整目录。`);
 }
 
 main();

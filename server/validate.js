@@ -32,7 +32,7 @@ export function optNumber(args, key, dflt = null) {
   const v = args?.[key];
   if (v === undefined || v === null) return dflt;
   if (typeof v === 'number' && Number.isFinite(v)) return v;
-  // 自癒：数字字符串（LLM 把 timeoutMs 传成 "60000" 是常见手误）
+  // 自愈：数字字符串（LLM 把 timeoutMs 传成 "60000" 是常见手误）
   if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Number(v);
   fail('E_INVALID_ARGS', `参数 "${key}" 必须是 number`);
 }
@@ -41,7 +41,7 @@ export function optBool(args, key, dflt = false) {
   const v = args?.[key];
   if (v === undefined || v === null) return dflt;
   if (typeof v === 'boolean') return v;
-  // 自癒：布尔字符串（"true"/"false"/"True"…，JSON schema 描述没被遵守时的常见形态）
+  // 自愈：布尔字符串（"true"/"false"/"True"…，JSON schema 描述没被遵守时的常见形态）
   if (typeof v === 'string') {
     const s = v.trim().toLowerCase();
     if (s === 'true' || s === '1' || s === 'yes') return true;
@@ -75,7 +75,7 @@ export function optArray(args, key) {
 
 export function oneOf(v, list, key) {
   if (list.includes(v)) return v;
-  // 自癒：字符串枚举大小写/首尾空白容错（"Passed"→passed、"p0"→P0），省掉宿主一轮重试
+  // 自愈：字符串枚举大小写/首尾空白容错（"Passed"→passed、"p0"→P0），省掉宿主一轮重试
   if (typeof v === 'string') {
     const s = v.trim();
     const hit = list.find((x) => typeof x === 'string' && x.toLowerCase() === s.toLowerCase());

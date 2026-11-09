@@ -1107,7 +1107,7 @@ async function recordTriageTool(args) {
     const caseId = reqStr(c, 'caseId');
     const classification = oneOf(reqStr(c, 'classification'), ['test-bug', 'code-bug', 'environment'], 'classification');
     let prio = c.priority;
-    if (typeof prio === 'number' && prio >= 0 && prio <= 3) prio = `P${prio}`; // 数字 0-3 自癒为 P0-P3
+    if (typeof prio === 'number' && prio >= 0 && prio <= 3) prio = `P${prio}`; // 数字 0-3 自愈为 P0-P3
     const priority =
       prio === undefined || prio === null || prio === ''
         ? null
