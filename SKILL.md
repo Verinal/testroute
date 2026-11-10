@@ -17,17 +17,17 @@ node "<skillDir>/cli.js" --list    # 列出全部工具
 ```
 
 - `<skillDir>` = 本 SKILL.md 所在目录（**路径永远加引号**，可能含空格）；`--root` 用被测项目绝对路径。
-- 简单参数可内联：`--args '{"phaseId":"unit","status":"passed","reason":"…"}'`；**复杂参数（route 对象、含中文/嵌套结构）一律先写 JSON 档再 `--args @<路径>` 传入**（用写文件工具生成，杜绝 shell 引号转义事故）；参数档放系统暂存目录或归档内，**不要落项目根**。
+- 简单参数可内联：`--args '{"phaseId":"unit","status":"passed","reason":"…"}'`；**复杂参数（route 对象、含中文/嵌套结构）一律先写 JSON 档再 `--args @<路径>` 传入**（用写文件工具生成，杜绝 shell 引号转义事故）；参数档一律放归档内（`test-archives/<归档>/`），**禁止落项目根**。
 - stdout=工具载荷；stderr=日志与错误。**退出码 0=成功，1=工具错误**（stderr 带 `[E_*]` 前缀，报错文本即正确出路），2=用法错误（查参数/工具名）。
-- 可能跑很久的执行（`run_tests`/`browser_probe`）用 Bash 后台方式发起，然后轮询 `get_route` 看进度并读回结果——不要同步干等超时。
+- 可能跑很久的执行（`run_tests`/`browser_probe`）用 Bash 后台方式发起，然后轮询 `get_route` 看进度并读回结果——不要同步干等超时。**后台指令的 stdout/stderr 重定向档（`> xxx.out 2> xxx.err`）一律写进归档目录内**（如 `<归档>/bg-<阶段id>.out`），**禁止落在项目根**——skill 在项目里落盘的位置只允许 `test-archives/` 一处，任何临时文件（重定向档、参数档、日志、中间产物）都不得例外。
 
 ## 总原则
 
 1. **不要整仓阅读**：`scan_project` 拿项目地图（响应为紧凑摘要，全量地图落盘 project-map.json），按模块小批量工作，控制上下文预算。
 2. **沙箱-only**：生成的用例一律写进 `init_archive` 返回的 `sandboxDir`（`<归档>/sandbox/`），禁止写进项目源码树。项目自有测试**只读参考**：可读、可借鉴断言思路，但**禁止执行与修改**——run_tests 的 paths/command 只许指向沙箱内用例（哈希门禁在阶段 passed 与 finalize 时校验；若基线不一致且确系用户本人所改，向用户核实后才传 `allowTestFileChanges` / `acknowledgeTestFileChanges` 重建基线）。全部测试产物留在归档内，删除整个 `test-archives/` 即完成清理。
 3. **每条用例至少一个断言**（assert/expect…），禁止"只执行不检查"的空用例；生成后回读：断言是否校验了预期、资源是否清理、复跑是否会被残留数据卡死（创建类数据用唯一后缀 + 清理步骤，见 e2e 内置变量）。
-4. **失败必须归因**（工具强制：失败 run 未归因禁止重跑）：`test-bug`→修用例重跑；`code-bug`→阶段标 failed，**必划 P0–P3 优先级**；`environment`→修环境重跑（全部归因 environment 时工具允许放行）。重跑时若失败指纹与上轮已归因失败完全一致，工具会自动继承归因（响应带 `triageCarriedFrom`），不必重复提交。
-5. **只测不修**：不改被测业务代码与项目自有测试脚本——即使用户同意、哪怕"顺手一行"；修复建议写进报告与 triage note，由维护者改完后你再重跑验证。**阶段失败后不要向用户提问"修不修 / 接下来怎么办"**：按该阶段 onFailure 语义推进即可（continue→下游照跑；block→下游如实标记 blocked），修与不修由维护者看最终报告决定，运行中不打断询问。对项目的任何意外改动逐文件 `record_change` 如实登记；装依赖只用 `provision_deps`（先展示计划征得用户同意，再 `confirm: true`；playwright 只装 npm 包，**任何情况下不要执行 `npx playwright install`**）。
+4. **失败必须归因**（工具强制：失败 run 未归因禁止重跑）：`test-bug`→修用例重跑；`code-bug`→阶段标 failed，**必划 P0–P3 优先级**；`environment`→修环境重跑（全部归因 environment 时工具允许放行）。重跑时若失败指纹与上轮已归因失败完全一致，工具会自动继承归因（响应带 `triageCarriedFrom`），不必重复提交。**同一失败指纹连续 ≥3 轮＝原地打转**：run_tests 拒绝再跑（换命令/换脚本重跑＝已换做法，直接放行；同命令复跑确有理由重验时传 `retrySameFingerprintReason` 留痕）；finalize 时任一阶段最近一次执行失败且未归因同样拦报告（先 record_triage）。执行历史以磁盘 `runs/` 为权威：route-reset 清掉的是路线内引用，不清归因义务、不清继承资格、不清收口计数。
+5. **只测不修**：不改被测业务代码与项目自有测试脚本——即使用户同意、哪怕"顺手一行"；修复建议写进报告与 triage note，由维护者改完后你再重跑验证。**任何失败 / 阻断 / 终止点上都不许向用户提问"修不修 / 接下来怎么办 / 跳不跳过"**——发现缺陷记录就行，处置路径协议已定死：`record_triage` 归因（code-bug 必划 P0–P3）→ 我方用例 / 数据 / 环境问题就在沙箱内修好后返工复跑；产品缺陷只记录不修——换用合法数据 / 绕开缺陷路径能让该阶段继续完成本职验证就调整沙箱内用例后继续全流程，同时把缺陷本体安排在对应深度阶段（如 negative）如实覆盖；核心流被阻断且无替代路径时直接 finalize_report 如实收尾（outcome=aborted、缺陷置顶）。下游是否放行按该阶段 onFailure 语义走（continue→下游照跑；block→下游如实标记 blocked），修与不修由维护者看最终报告决定，运行中不打断询问。对项目的任何意外改动逐文件 `record_change` 如实登记；装依赖只用 `provision_deps`，且审批**前置到路线批准一次完成**：save_route 按路线执行器自动算出 `provisionPlan`（如 browser-e2e → playwright npm 包）随响应返回——**批准摘要必须逐项列出该计划**（装什么/为什么/装哪/带 `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` 不下载浏览器），**用户批准路线=批准该计划**；运行中 provision_deps 返回 `preConsented:true` 的就是计划内依赖，展示计划留痕后直接 `confirm: true`，**不再发问**；`preConsented:false`（规划时预见不了的意外依赖）才在运行时征询。playwright 只装 npm 包，**任何情况下不要执行 `npx playwright install`**）。
 6. **诚实优先**：跑不了就标 skipped + 原因，不虚构"看起来能跑"的产物。写入归档的文本（notes/triage.note/用例注释）一律简体中文；对话语言跟随用户。**CLI 调用逾时/中断 ≠ 授权手动补档**：长执行用后台方式发起再轮询 `get_route`，已在后台跑完并落盘的 run 会照常读回，进度不会丢；**任何情况下都不许手写或补造归档文件**（manifest 事件、runs/*/result.json、route.json、final-report.md），那是伪造归档，会被 `verify_archive` 判 TAMPERED 整份作废。阶段没跑就 `update_phase { status: "skipped", reason }` + 向用户老实说明——宁可不测、不可造假。
 
 ## 案例卡与全流程证据（生成的每个测试文件必须遵守）
@@ -60,29 +60,35 @@ node "<skillDir>/cli.js" --list    # 列出全部工具
 
 按执行先后分层，前轻后重。阶段 `id` 必须用下表标准 id（save_route 会把 "smoke-01" 式后缀自动规范化，返回 `normalizedIds`——别依赖改写，直接用标准 id）。
 
+**scope（全流程 vs 定向，引擎强制）**：save_route 缺省自动置 `scope: "full"`——专家级齐全测试是本 skill 的默认契约，不靠 LLM 自觉。scope=full 时引擎逐项校验下表「何时纳入」的强制条件：条件适用的阶段缺一，approve 直接 E_GATE 拦下（报错列明每项缺口与出路）；条件不满足的自动不要求。单独测某个阶段/某类是显式选择：`scope: "targeted"` + 非空 `scopeReason`（一句话进归档留痕）。用户确认裁剪某必需阶段 → 逐项 `"fullFlowWaiver": [{ "phase": "<阶段id>", "reason": "<理由>" }]` 留痕（报告原样引用）；豁免先向用户确认，禁止整条路线不测完收工。
+
 | 层 | 阶段 id | 一句话定位 | 默认 executor | 默认 onFailure | 何时纳入 |
 | --- | --- | --- | --- | --- | --- |
-| 1 准入 | `connectivity` | 能不能连上 | `health`（配 targets）\| `generic` | **abort** | 项目有可运行服务 |
+| 1 准入 | `connectivity` | 能不能连上 | `health`（配 targets）\| `generic` | **abort** | 有可测服务（targets 已知或 API 项目）——scope=full 必纳 |
 | 1 准入 | `smoke` | 能不能跑主流程 | `generic`（沙箱脚本） | **abort** | 同上；连通性通过后才跑 |
-| 2 代码 | `unit` | 函数/类逻辑对不对 | vitest/jest/pytest/generic | block | 几乎总是 |
-| 2 代码 | `sast` | 源码缺陷/不安全写法 | `generic`（semgrep 等） | continue | 建议默认纳入；无工具时降级 planning |
-| 3 集成 | `integration` | 模块/服务之间对不对 | generic/框架 | block | 多模块、跨服务、有 DB/第三方依赖 |
-| 3 集成 | `contract` | 接口契约一致 | generic（openapi-diff 等） | block | 有 OpenAPI/schema |
-| 3 集成 | `api-functional` | 接口黑盒功能 | generic/pytest | block | 有 HTTP API |
-| 4 系统 | `e2e` | 业务流程走得通 | `e2e`（内置声明式 HTTP） | block | 有可运行服务；steps 写进路线可评审 |
-| 4 系统 | `browser-e2e` | 真实浏览器流程 | `playwright` | continue | **仅前端项目且用户开启**（specials） |
-| 4 系统 | `boundary` | 极值下对不对 | 框架/generic | block | 常纳入（0/空串/超长/空数组） |
-| 4 系统 | `negative` | 非法输入下稳不稳 | 框架/generic | block | 常纳入（乱码/错类型/非法格式） |
-| 4 系统 | `regression` | 老功能没被改坏 | 框架/generic | block | git 有变更时；diff 驱动，用例沙箱新生成 |
-| 5 非功能 | `load` `stress` `soak` `resilience` `chaos` `compatibility` | 压力下稳不稳 | generic（k6 等） | continue | **仅用户开启**，写入 route.specials |
-| 6 安全 | `authz` | 鉴权/越权 | generic（LLM 生成用例） | **block** | 用户开启安全段时必含 |
-| 6 安全 | `sca` | 依赖已知漏洞 | `sca`（内置零依赖） | continue | 用户开启；有 lock 文件时最有价值 |
+| 2 代码 | `unit` | 函数/类逻辑对不对 | vitest/jest/pytest/generic | block | **恒必需** |
+| 2 代码 | `sast` | 源码缺陷/不安全写法 | `generic`（semgrep 等） | continue | **恒必需**（scope=full）；无工具时降级 planning |
+| 3 集成 | `integration` | 模块/服务之间对不对 | generic/框架 | block | scope=full：API 项目且盘点模块 ≥2 必纳 |
+| 3 集成 | `contract` | 接口契约一致 | generic（openapi-diff 等） | block | scope=full：盘点到 openapi/swagger 必纳 |
+| 3 集成 | `api-functional` | 接口黑盒功能 | generic/pytest | block | API 项目（端点 ≥5）——scope=full 必纳 |
+| 4 系统 | `e2e` | 业务流程走得通 | `e2e`（内置声明式 HTTP） | block | scope=full：有服务且 API 项目必纳；steps 写进路线可评审 |
+| 4 系统 | `browser-e2e` | 真实浏览器流程 | `playwright` | continue | scope=full：前端项目必纳（另有最低流程级用例数门禁，见下） |
+| 4 系统 | `boundary` | 极值下对不对 | 框架/generic | block | API 项目 scope=full 必纳（0/空串/超长/空数组） |
+| 4 系统 | `negative` | 非法输入下稳不稳 | 框架/generic | block | API 项目 scope=full 必纳（乱码/错类型/非法格式） |
+| 4 系统 | `regression` | 老功能没被改坏 | 框架/generic | block | scope=full：git 有真实源码变更时必纳（引擎判定，untracked 与测试产物不计）；diff 驱动，用例沙箱新生成 |
+| 5 非功能 | `load` `stress` `soak` | 压力下稳不稳 | generic（k6 等） | continue | scope=full：有可测服务必纳（耗时长可放宽强度，不可缺席）；其余时候仅用户开启（specials） |
+| 5 非功能 | `resilience` `chaos` | 故障注入类 | generic | continue | **保持 opt-in**（仅用户开启，specials） |
+| 5 非功能 | `compatibility` | 多环境表现一致 | generic | continue | scope=full：前端项目必纳（多浏览器/视口）；其余仅用户开启 |
+| 6 安全 | `authz` | 鉴权/越权 | generic（LLM 生成用例） | **block** | 盘点有受保护端点时 scope=full 必纳 |
+| 6 安全 | `sca` | 依赖已知漏洞 | `sca`（内置零依赖） | continue | **恒必需**（内置零依赖不发包） |
 | 6 安全 | `dast` | 动态安全探测（按盘点端点全量黑盒探测） | `security-probe`（内置零依赖） | continue | **API 项目且服务可发包时 save_route 自动补齐**；用户明确不要才移除并留痕 |
-| 6 安全 | `secrets` | 密钥/敏感信息泄露 | `secrets`（内置零依赖） | continue | 用户开启；扫源码模式 + 被跟踪的 .env |
-| 6 安全 | `business-logic` | 绕开业务规则 | generic（LLM 生成用例） | continue | 用户开启；重复下单/刷积分/改价格 |
-| 7 验收 | `uat` `canary` | 业务方验收/灰度 | kind=`manual` | continue | 交付前；产出清单到 manual-cases/ |
+| 6 安全 | `secrets` | 密钥/敏感信息泄露 | `secrets`（内置零依赖） | continue | **恒必需**（扫源码模式 + 被跟踪的 .env） |
+| 6 安全 | `business-logic` | 绕开业务规则 | generic（LLM 生成用例） | continue | API 项目 scope=full 必纳；重复下单/刷积分/改价格 |
+| 6 安全 | `pentest` | 渗透测试（高阶） | generic | continue | **保持 opt-in**；自动化仅覆盖子集，需人工渗透补充 |
+| 7 验收 | `uat` | 业务方验收 | kind=`manual` | continue | **恒必需**——scope=full 缺省由 save_route 自动注入（`fullFlowDefaultsInjected`）；产出清单到 manual-cases/ |
+| 7 验收 | `canary` | 金丝雀/灰度 | kind=`manual` | continue | **保持 opt-in**（人工/运维流程） |
 
-**阻断语义**（工具强制）：`abort`=失败终止全链路（后续 pending 全 blocked + route.terminated；修复后把该阶段置回 in-progress 即自动解除）；`block`=下游 blocked；`ask`=下游 awaiting-approval 等人工裁决；`continue`=只记录不拦截。表内默认值即推荐值，改动要有理由。
+**阻断语义**（工具强制）：`abort`=失败终止全链路（后续 pending 全 blocked + route.terminated；归因处置后把该阶段置回 in-progress 即自动解除——我方用例问题修用例复跑，产品缺陷不修代码，按第 5 条定死的路径处置）；`block`=下游 blocked；`ask`=下游 awaiting-approval 等人工裁决；`continue`=只记录不拦截。表内默认值即推荐值，改动要有理由；**规划 onFailure 不选 `ask`**——用例失败 / 产品缺陷的处置答案协议已定死，ask 只会把已定答案再抛给用户，仅确需用户裁决的特殊场景（如高危操作前确认）才允许并说明理由。
 
 ### e2e（HTTP）阶段怎么写
 
@@ -111,12 +117,14 @@ executor=`e2e` 用声明式 steps（不写测试代码，steps 进路线批准�
 
 ### 浏览器 E2E（browser-e2e，必须遵守）
 
-1. **前端项目默认建议开启**：save_route 对前端项目且路线无 browser-e2e 时返回 `browserE2eSuggested=true`——批准摘要必须向用户呈现（说明证据链价值：全流程截图/trace 重播/video），用户同意就纳入路线并写入 specials；用户明确不要才裁掉，理由写进 notes 留痕。项目没装 playwright 走 provision 同意流程。
+1. **前端项目默认建议开启**：save_route 对前端项目且路线无 browser-e2e 时返回 `browserE2eSuggested=true`——批准摘要必须向用户呈现（说明证据链价值：全流程截图/trace 重播/video），用户同意就纳入路线并写入 specials；用户明确不要才裁掉，理由写进 notes 留痕。项目没装 playwright：**规划阶段就核实**（查 frontend 的 package.json/`node_modules`，或在项目内用 `npx --no-install playwright --version` 验证解析，不要凭全局 npx 可用就假设项目内可用），缺了就把**安装计画列入批准摘要**（命令、`-D` 落 package.json devDependency、`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` 不下载浏览器、优先附着编辑器内置浏览器/系统 Chrome、结束后 `npm uninstall` 可还原），经用户在路线评审时一次同意——**不要拖到 browser-e2e 执行阶段才中途发问**。
 2. **浏览器优先级（三层，逐层降级、不跳级）**：① 编辑器内置浏览器（CDP 附着，`chromium.connectOverCDP`；交互式浏览/调试直接用 builtin-browser MCP）> ② 系统 Chrome/Edge（`channel: 'chrome'/'msedge'`，零下载）> ③ chromium 缓存（最后手段）。下载 chromium 永远垫底：**任何情况下不要自行执行 `npx playwright install`**，浏览器获取只走 `provision_deps` 的计划审批。
 3. **生成前必须 `browser_probe`（`--root` + `--args '{"url":"…"}'`）**：选择器必须来自探针返回的真实结构（优先 getByRole 语义，其次稳定 data-testid），**禁止凭空写选择器**。
 4. **证据链**：按「案例卡与全流程证据」节执行（test.use 全开 + 逐步截图 + 案例卡）。探针报告的 consoleErrors 里与被测功能相关的错误写进用例断言；triage note 引用失败用例的 trace/video/截图路径；通过用例的证据链同样会进报告的「全量用例清单」。
 5. playwright 命令的证据开关由工具注入：默认命令自带 `--reporter=json --trace on --output --config=<证据 wrapper>`；覆盖 command 时工具会把这三样补进 `playwright test` 段（并把 `--config` 重写到 wrapper）——**不要手删**。**自定义命令必须含 `playwright test` 段**（node 自管脚本挂名 playwright 会被 E_GATE 拒绝）；覆盖 command 时仍须自行保证报告落归档（保留 `--reporter=json` 与 `PLAYWRIGHT_JSON_OUTPUT_*` 环境变量生效，config 内勿覆写 outputFile）。
-6. **页面覆盖上报**：沙箱脚本把浏览器实际访问过的页面路由写入环境变量 `TESTROUTE_PAGES_COVERAGE_FILE` 指向的文件（JSON 数组，如 `["/login", "/items/42"]`；路径参数写实际值，工具归一化对齐盘点）。盘点 ≥5 页时不上报 = finalize 页面门禁把全部页面记为缺口。测试脚本可用归档快照 `web-pages.json`（环境变量 `TESTROUTE_PAGES_FILE`）逐页规划访问。
+6. **页面覆盖上报**：沙箱脚本把浏览器实际访问过的页面路由写入环境变量 `TESTROUTE_PAGES_COVERAGE_FILE` 指向的文件（JSON 数组，如 `["/login", "/items/42"]`）。**上报值必须与页面盘点逐字一致**（照抄 `TESTROUTE_PAGES_FILE` 快照里的路径），不得拼出 `//xxx` 这类多一道前导斜杠的路径——含 `//` 的上报引擎拒收：不计入覆盖、警告点名，页面按缺口处理（真实事故：`BASE + '/shopping'` 而 BASE 已带斜杠 → URL 拼成 `//shopping`，SPA 路由不匹配落在首页，上报却被归一成 `/shopping` 记成"已覆盖"，截图证明页面从未渲染）。盘点 ≥5 页时不上报 = finalize 页面门禁把全部页面记为缺口。测试脚本可用归档快照 `web-pages.json`（环境变量 `TESTROUTE_PAGES_FILE`）逐页规划访问。
+7. **流程基线与深度门禁（scope=full 硬门禁，数量 + 对账双闸）**：save_route 对 scope=full 的前端项目返回 `browserE2eFlowBaseline`——由项目盘点**推导的必测业务流清单**（`auth` 登录→核心操作→登出、`crud-<module>` 每模块 UI 增删改查、`form-error` 表单错误态），**批准摘要逐条列出**，用例按清单生成。update_phase(passed) 前引擎两道闸：① **数量**：用例数 ≥ `max(4, ceil(页面盘点数/4), 流程基线数)`（save_route 返回的 `browserE2eFlowBaseline.minCases` 就是这个数）；② **对账**：清单里每条业务流必须有用例标题带 `@flow:<id>` 标签（如 `"注册登录主流程 @flow:auth"`）——纯页面走查没有标签、对不上账，缺流 → 补对应用例重跑（生成前先 browser_probe），或用户确认裁剪后 `fullFlowWaiver` 写 `{ "phase": "browser-e2e", "reason": "…" }` 留痕。**每条流程级用例覆盖一个完整业务流**；页面走查最多算 1 条。
+8. **落地断言（跳转后必断"到达了"，不是只断 URL）**：`page.goto(X)` 之后 `toHaveURL(X)` 必然成立——URL 断言只核对地址栏，**与页面渲染无关，属无效断言**（真实事故：`goto('//shopping')` 落在首页，`toHaveURL(/shopping/)` 与"body 非空"全部通过，7 张截图 6 张是首页，playwright 判 passed）。每次跳转/路由切换后**必须断言目的地页面的特征内容**——该页独有的标题、文案或元素（从 browser_probe 抓的真实结构里选，如"购物清单"页头、库存表格首列）；登录流要断言登录态标识（用户名/头像/登出入口）而非仅 URL 变化。断言内容写进案例卡"预期"字段。
 
 ### 覆盖率与 flaky（可选增强）
 
@@ -144,6 +152,15 @@ executor=`e2e` 用声明式 steps（不写测试代码，steps 进路线批准�
 - **每模块深度（用例怎么才算够）**：每个模块的端点至少覆盖——正常主流程、CRUD 全操作、资源归属三身份（属主 / 其他用户 / 未认证）、非法输入（错类型/缺字段/非法格式）、边界（空串/0/超长/最大值/空数组）。**"113 个端点只测了 30 个"不叫测过**：finalize 的覆盖硬门禁（见下）会在缺口清零前直接拦下收尾，「API 覆盖矩阵」段按模块列明已测/总数与未覆盖端点清单，未覆盖 = 补测优先级。
 - **authz 怎么挑目标**：从 apiSurface 的鉴权端点里挑带资源 id 的（GET/PUT/DELETE `/xxx/{id}`）做水平越权（用户 A 建 → 用户 B 访问 → 403/404 且响应不泄露 A 数据），挑管理员/角色接口做垂直越权（普通用户 token → 401/403）；public 端点只验功能不验越权。
 - **覆盖上报（run_tests 自动收集进 result）**：沙箱脚本把实际触及的端点写入环境变量 `TESTROUTE_COVERAGE_FILE` 指向的文件——JSON 数组，每项 `"METHOD /path"`（如 `["GET /api/items", "POST /api/items"]`；路径参数写实际值即可，工具自动归一化对齐盘点：`/api/items/42` ≙ `/api/items/{p}`）或 `{ "method": "POST", "path": "/api/items", "kinds": ["negative","boundary"] }`（kinds 显式声明该端点被哪类深度用例触及；缺省按所在阶段归类：negative 阶段→negative、boundary→boundary、authz→authz、其余→functional）。不写不影响执行，但覆盖门禁会把对应端点全部记为缺口——**沙箱 HTTP 用例必须上报**。
+- **非幂等 POST 的副作用约束**：盘点里有触发长任务/外部调用/不可逆写入的 POST（LLM/VLM 生成、发邮件、支付、批量导入、注册类……），矩阵/覆盖脚本**不得为凑数盲目打真实请求**——先读路由代码确认哪条分支是纯请求校验（缺字段 422 / 非法格式 400），用合法负向样本上报覆盖；确实会触发分钟级长任务或不可逆副作用的主流程分支，走 `coverageWaiver` 留痕或在该阶段用 skip 注明原因，不许硬打。**用例 docstring 写「只测请求校验路径」不算数**——以代码分支与实际执行耗时为准。真实事故：覆盖矩阵对「AI 生成每日菜单」端点全量 POST 真实请求，后端每次真调 LLM/VLM（单次 245s/781s），叠加测试自身注册流量触发限流退避，整轮执行撞 300s 超时、0 用例入档。同类约束适用于注册/登录类端点：批量用例共享一个会话，避免每例新注册撞限流（限流窗口 5 次/60s 级别时连续注册必然雪崩）。
+- **用例级结果上报（generic 阶段硬义务）**：generic 脚本必须逐用例产出结果，二选一：① 把 `[{ "name": "用例名", "status": "passed|failed|skipped", "message": "失败原因（失败时）" }]` 写入环境变量 `TESTROUTE_RESULTS_FILE` 指向的文件；② 逐行输出 `PASS | 用例名` / `FAIL | 用例名`（也认 `ok - ` / `not ok - `）。只打 `Total: N, Passed: X, Failed: Y` 汇总行或只有 exit code 的 run **没有用例级结果，update_phase 标 passed 会被引擎拦下**——「passed 但报告里无用例明细」等于报告失信；逐用例结果会进最终报告「全量用例清单」，读者才能核对到底测了什么、怎么复现。
+
+### 全流程强制集（scope=full，工具强制，approve 第三道门禁）
+
+- **save_route 返回 `fullFlowBaseline`**（scope / required / missing / waived / inapplicable / gitDirty / pagesTotal / browserE2eMinCases）：`missing` 非空 = 缺必需阶段，save 时提示、**approve 硬拦**。恒必需：`unit` `sast` `sca` `secrets` `uat`；条件必需：`connectivity`+`smoke`+`load`+`stress`+`soak`（有可测服务）、`integration`（API 项目且模块 ≥2）、`contract`（盘点到 openapi/swagger）、`api-functional`/`boundary`/`negative`/`business-logic`（API 项目）、`authz`（有受保护端点）、`e2e`（有服务且 API 项目）、`browser-e2e`+`compatibility`（前端项目）、`regression`（git 有真实源码变更）。条件不满足的自动不要求（`inapplicable` 列明条件，不要硬凑阶段）；`resilience`/`chaos`/`pentest`/`canary` 永不强制（opt-in；`dast` 另由深度基线按 connectivity targets 强制）。
+- **uat 自动注入**：scope=full 且路线无 uat 且未豁免时，save_route 自动补（manual 阶段、无执行器，返回 `fullFlowDefaultsInjected`）——批准摘要须说明；用户明确不要时移除本阶段并 `fullFlowWaiver` 留痕。
+- **豁免与定向**：用户确认裁剪某必需阶段 → 逐项 `"fullFlowWaiver": [{ "phase": "<标准阶段id>", "reason": "<理由>" }]`（save_route 校验 phase 必须是标准 id、reason 非空；报告原样引用）。定向测试 → `"scope": "targeted"` + `"scopeReason": "<一句话>"`，缺 reason 直接拒收。两者都是显式留痕的例外，**不是省事后门**。
+- **报告对账（finalize）**：最终报告含「全流程完整性对照（scope=full）」段——必需阶段逐行列纳入/状态/执行次数/豁免理由，运行中被 skipped 的必需阶段在此显著呈现（结论不含它们，不是完整全流程）；报告头部摘要行给 present/required 总数。缺口不拦 finalize（诚实优先），但无处遁形。
 
 ### 覆盖硬门禁（finalize 强制，「全流程测过」的工具判定标准）
 
@@ -164,9 +181,10 @@ executor=`e2e` 用声明式 steps（不写测试代码，steps 进路线批准�
 
 1. **扫描**：`cli.js scan_project --root <root>`——返回的 `apiSurface` 是 API 端点盘点（总数/鉴权/模块），API 项目按「API 深度基线」裁路线；关心增量再加 `read_changes`（有源码变更无测试→生成范围；已有测试→回归范围）。
 2. **建归档**：`cli.js init_archive --root <root> --args '{"label":"…"}'` → 记下 `sandboxDir`。
-3. **规划路线**：按链路表 + 项目信号裁剪。纯库/无服务项目跳过 connectivity/smoke/e2e 从 unit 开始；有服务项目 connectivity 的 targets 从地图推（不确定就问用户）；前端项目建议 browser-e2e；非功能与安全专项用户没提就不放。每阶段 `notes` 写规划理由（简体中文）。骨架：
+3. **规划路线**：**先记下用户请求原话**——路线必填 `userRequest`（用户对本次测试请求的原话，逐字引用、不改写、不概括、不翻译；缺了 save_route 直接拒收），批准摘要与最终报告头部以此做范围对照。**再判定 scope**——默认 `full`（全流程=专家级齐全；强制集见「全流程强制集」节，save_route 缺省自动置 full）；只有用户明确只要测某个阶段/某类才写 `scope: "targeted"` + `scopeReason`。scope=full 时按强制集**主动纳齐阶段，不要等 approve 被拦才补**。纯库/无服务项目：connectivity/smoke/load/stress/soak/e2e 等条件不满足时自动不要求（引擎按条件重判，不要硬凑）；有服务项目 connectivity 的 targets 从地图推（不确定就问用户）；前端项目纳 browser-e2e+compatibility；`resilience`/`chaos`/`pentest`/`canary` 仍仅用户开启（specials）。**规划时逐阶段盘点依赖**：该阶段要跑的执行器/工具在项目里是否真实可用（以项目内解析为准——查 package.json/node_modules 或在项目根跑 `npx --no-install <命令> --version` 验证，**不要凭全局命令可用就假设项目内可用**）；缺什么、装到哪、什么命令、什么影响，全部带到下一步批准摘要里一次问清——**不许把依赖问题留到执行阶段才首次发问**（引擎会按路线执行器自动算出 `provisionPlan` 随 save_route 响应返回，批准摘要对照它逐项列出；用户批准路线=批准依赖计划，计划内依赖运行中不再发问）。每阶段 `notes` 写规划理由（简体中文）。骨架：
 ```json
 { "schemaVersion": 1, "mode": "generate-and-execute", "status": "draft",
+  "userRequest": "<用户请求原话，逐字引用>",
   "project": { "name": "<项目名>", "techStack": "<一句话>" },
   "specials": ["load"],
   "phases": [
@@ -179,29 +197,33 @@ executor=`e2e` 用声明式 steps（不写测试代码，steps 进路线批准�
   ]
 }
 ```
-4. **人工评审检查点（强制）**：把完整路线写进参数档后 `cli.js save_route --root <root> --args @<参数档>`（action 默认 save）→ 向用户呈现：层-阶段清单、每阶段范围、阻断语义、专项开关、**安全段包含/跳过清单**（对照返回 `security`）、需安装的依赖。`hint` 是必含项清单；`normalizedIds`/`securityDefaultsInjected` 表示工具改写了路线，须说明；**`depthBaseline.gaps` 非空 = 缺深度阶段，补齐或向用户说明后走 depthWaiver**，不许静默忽略。**停下等用户确认**后再 save_route 传 `"action":"approve"`。
+4. **人工评审检查点（强制）**：把完整路线写进参数档后 `cli.js save_route --root <root> --args @<参数档>`（action 默认 save）→ 向用户呈现：**「用户请求原话」开头做范围对照**（路线必填 `userRequest`——用户对本次测试请求的原话，逐字引用、不改写、不概括、不翻译；摘要先原样引用它，再逐点对照：用户点名的范围必须全覆盖，超出点名范围的部分说明将由全流程标准链路补齐——用户说"测反爬和安全性"就不能只交付安全段，也不许把没点名的东西悄悄混进来不说明）、**scope 声明与全流程对照**（scope=full 时对照返回的 `fullFlowBaseline`——required/missing/waived/inapplicable；**`missing` 非空 = 补齐阶段，或经用户确认后逐项 `fullFlowWaiver` 留痕，不许静默忽略**；targeted 时说明 scopeReason）、层-阶段清单、每阶段范围、阻断语义、专项开关、**安全段包含/跳过清单**（对照返回 `security`）、需安装的依赖（**依赖同意在这里一次性收齐**：逐项列明缺什么、命令、装到哪个包、影响与卸载方式；已列入摘要的依赖执行阶段直接走 provision_deps，不再中途发问）。`hint` 是必含项清单；`normalizedIds`/`securityDefaultsInjected`/`fullFlowDefaultsInjected` 表示工具改写了路线，须说明；**`depthBaseline.gaps` 非空 = 缺深度阶段，补齐或向用户说明后走 depthWaiver**，不许静默忽略。**停下等用户确认**后再 save_route 传 `"action":"approve"`。**批准后改路线必须重新批准**：已批准路线（approved/in-progress）再 save 会被 E_GATE 拒收（防覆盖历史）；改动（增删阶段/改执行器或命令/加豁免/换 scope）先向用户说明并获确认，再以 `action:"approve"` 重新提交完整路线重新评审——执行记录保留（响应带 `reapproved:true`），同内容重发 approve 是幂等的（`alreadyApproved:true`）；完全推倒重来才 `resetRoute:true`。
 5. **按阶段串行推进**：`update_phase`（`--args '{"phaseId":"…","status":"in-progress"}'`）→
    - **planning**：结论写 notes → passed。**manual**：清单写 manual-cases/ → passed（或留给用户，报告说明）。
-   - **generate/execute**：读 1-3 个被测文件 → 写用例进沙箱 → `snapshot_files` 快照 + notes 写 checkpoint → `run_tests`（`--args '{"phaseId":"…"}'`，易抖动阶段加 `"retryFailedOnce": true`，需要长执行时后台发起再轮询）。paths/command 用相对 root 的路径指进沙箱。Python 用 pytest 执行器 + 沙箱放一行 conftest.py：`import os, sys; sys.path.insert(0, os.getcwd())`；Node 最通用是 generic + `node --test <沙箱相对路径>`。
+   - **generate/execute**：读 1-3 个被测文件 → 写用例进沙箱 → `snapshot_files` 快照 + notes 写 checkpoint → `run_tests`（`--args '{"phaseId":"…"}'`，易抖动阶段加 `"retryFailedOnce": true`，需要长执行时后台发起再轮询）。paths/command 用相对 root 的路径指进沙箱。Python 用 pytest 执行器 + 沙箱放一行 conftest.py：`import os, sys; sys.path.insert(0, os.getcwd())`；Node 最通用是 generic + `node --test <沙箱相对路径>`。**超时预算**：矩阵/全量类阶段按上一轮实际耗时估 `timeoutMs`（默认 300s；上一轮耗时 ≥70% 预算时工具会在响应 `budgetAdvisories` 提醒调大；撞线超时整轮作废、0 用例入档，run warnings 会点名）。
    - **执行后**：全过 → passed；有失败 → `record_triage` 逐条归因（0 用例崩溃时先看 runDir 下 raw/console-*.log）→ code-bug 则 `update_phase` 标 failed 并在 triage 划优先级。
    - **优先级（code-bug 必划，finalize 门禁强制）**：**P0 阻断**=主流程不可用/安全漏洞/数据丢失/服务崩溃（必须最先修复）；**P1 严重**=核心功能缺陷有绕过；**P2 一般**=次要/边界；**P3 轻微**=体验/文案/建议。拿不准向上靠（疑似安全/数据问题一律 P0）。
 6. `nextActions` 给出合法下一步，照做。
-7. **收尾**：缺口未清零时 finalize 被 E_GATE 拦下（报错列明每项缺口）——先按缺口清单补测/上报覆盖，个别端点确实测不了再走 `coverageWaiver` 逐项登记；**不许拿豁免当省事后门**。缺口清零后 `cli.js finalize_report --root <root>` → 汇报 final-report.md：层级结论 + **缺陷清单（P0 置顶显著标出，逐条给定位与修复方向）** + 失败归因（含未归因标记）+ **API 覆盖矩阵（端点 × 用例种类逐格对照）+ 页面覆盖对照 + 覆盖豁免（有则逐项引用理由）** + **全量用例清单（通过与失败都写明做法/复现/证据）** + 复现指南 + 后续建议；向用户说明证据播放方式（trace.zip 拖进 https://trace.playwright.dev 逐步重播、离线 `npx playwright show-trace <路径>`；video.webm 直接拖进浏览器播放）。**报告带机器可验封章（正文 sha256 写进尾注 + route.report + finalize 事件三处一致）——最终报告只能由 finalize_report 产出；手写 final-report.md、生成后改动报告或手改 route.json 都会被 get_route 的 `reportIntegrity` 识破亮红，归档从此不可信**。**交付前报告自查（强制，坏结构的报告不许流到用户面前）**：汇报前用文本搜索定位检查 final-report.md 两处（不必通读全文）——① 搜「已截断」：任何表格行（复现指南/归因/豁免表等）不得出现截断，每行必须单行完整、复现命令可直接复制执行；② 搜「案例卡缺失」：有文件路径的用例不得出现。任一命中 = 工具引擎版本落后或异常：**不要照着坏报告复述结论**，如实向用户说明哪一段不可信，先更新 skill 引擎后重新 `finalize_report` 再交付。**最终答复必须原样引用返回的 `changesBlock`**（本次装了什么、怎么卸、改了哪些文件）。
+7. **收尾**：缺口未清零时 finalize 被 E_GATE 拦下（报错列明每项缺口）——先按缺口清单补测/上报覆盖，个别端点确实测不了再走 `coverageWaiver` 逐项登记；**不许拿豁免当省事后门**。缺口清零后 `cli.js finalize_report --root <root>` → 汇报 final-report.md：层级结论 + **缺陷清单（P0 置顶显著标出，逐条给定位与修复方向）** + 失败归因（含未归因标记）+ **API 覆盖矩阵（端点 × 用例种类逐格对照）+ 页面覆盖对照 + 覆盖豁免（有则逐项引用理由）+ 全流程完整性对照（scope=full：必需阶段逐项对账，缺/跳过/豁免如实引用）** + **全量用例清单（通过与失败都写明做法/复现/证据）** + 复现指南 + 后续建议；向用户说明证据播放方式（trace.zip 拖进 https://trace.playwright.dev 逐步重播、离线 `npx playwright show-trace <路径>`；video.webm 直接拖进浏览器播放）。**报告带机器可验封章（正文 sha256 写进尾注 + route.report + finalize 事件三处一致）——最终报告只能由 finalize_report 产出；手写 final-report.md、生成后改动报告或手改 route.json 都会被 get_route 的 `reportIntegrity` 识破亮红，归档从此不可信**。**交付前报告自查（强制，坏结构的报告不许流到用户面前）**：汇报前用文本搜索定位检查 final-report.md 两处（不必通读全文）——① 搜「已截断」：任何表格行（复现指南/归因/豁免表等）不得出现截断，每行必须单行完整、复现命令可直接复制执行；② 搜「案例卡缺失」：有文件路径的用例不得出现；③ **数字对账（跨段一致性，静态搜三对）**：报告头部「API 覆盖 X/Y」与「API 覆盖对照」段的端点覆盖数一致；「页面覆盖 a/b（另豁免 c）」满足 a+c=b 且 b=「页面盘点」数；「阶段汇总」各阶段执行次数与「失败与归因」表里的 run 数对得上（执行历史含 route-reset 之前的全部 run，报告缺失整段历史 = 引擎旧版扫丢）。任一命中 = 工具引擎版本落后或异常：**不要照着坏报告复述结论**，如实向用户说明哪一段不可信，先更新 skill 引擎后重新 `finalize_report` 再交付。**最终答复必须原样引用返回的 `changesBlock`**（本次装了什么、怎么卸、改了哪些文件）。
 
 ## generate-only 模式与断点续跑
 
 - 仅生成模式不调 run_tests；用例生成进沙箱并快照后 passed（execute 类阶段请直接规划为 generate，或 skipped 注明"仅生成模式未执行"）。
-- 重新进入：`cli.js get_route --root <root>`（默认返回紧凑摘要，自动定位最新归档）→ 看 `nextActions` 与 checkpoint 续跑；`route.terminated` 存在说明准入层失败终止过，按提示先修复再解锁。除错才传 `--args '{"detail":"full"}'`（内联 route.json 全文）。**怀疑归档被手改、或上一轮可能绕过工具时，先 `verify_archive` 自验再续跑**：verdict=TRUSTED 才可信；TAMPERED 的归档与报告整份作废，按缺口用工具重跑，不得手写补档掩盖。
+- 重新进入：`cli.js get_route --root <root>`（默认返回紧凑摘要，自动定位最新归档）→ 看 `nextActions` 与 checkpoint 续跑；`route.terminated` 存在说明有阶段失败终止过全链路，按失败归因协议处置后再解锁（我方用例 / 环境问题修好复跑；产品缺陷只记录划级、不修被测代码，按第 5 条定死的路径走，不向用户提问）。除错才传 `--args '{"detail":"full"}'`（内联 route.json 全文）。**怀疑归档被手改、或上一轮可能绕过工具时，先 `verify_archive` 自验再续跑**：verdict=TRUSTED 才可信；TAMPERED 的归档与报告整份作废，按缺口用工具重跑，不得手写补档掩盖。
 
 ## 禁止事项
 
 - 禁止跳过人工评审直接 approve（工具也会拒绝）；禁止手搓归档目录/manifest、绕过工具改 route.json。**禁止手写/补造任何归档文件**（manifest 事件、runs/*/result.json、route.json、final-report.md）——CLI 调用失败或中断不是例外。归档可信度可主动验证：`cli.js verify_archive --root <root>`（或离线 `node "<skillDir>/scripts/check-archive.mjs" <归档|项目根>`，退出码 0/1/2=TRUSTED/SUSPECT/TAMPERED）核对 manifest 事件连续性、result.json 工具指纹与报告封章；TAMPERED 的归档整份作废，不得引用其结论。
+- 禁止把 skill 执行产生的任何文件落在项目根或源码树——后台重定向档、参数档、日志、coverage 中间产物、临时脚本一律放归档目录内（`test-archives/<归档>/`）；发现落错位置立即清理。
 - 禁止修改项目自有测试脚本与被测业务代码（哈希门禁 + 只测不修；意外改动必须 `record_change` 留痕）。
 - 禁止生成没有档头案例卡的测试文件（所有执行器一视同仁，含 smoke/sast 等脚本；六字段见「案例卡与全流程证据」）。
 - 禁止把大量源码/日志粘贴进对话（完整日志在归档 raw/，引用路径即可）。
 - 禁止对未授权目标执行安全测试（dast/pentest/越权利用只针对用户明确授权的服务发包）。
+- **禁止为省事把全流程任务规划成 `scope: "targeted"`**（用户明确要定向测试除外，且必须附 scopeReason）；scope=full 时缺必需阶段不补齐、或未经用户确认就写 `fullFlowWaiver`，同罪。豁免是逐项留痕的例外，不是绕过强制集的后门。
 - 禁止跳过改动说明：finalize 后的最终答复必须原样包含 `changesBlock`。
 
 ## 安装与可携性
 
 整个 skill 目录（SKILL.md + cli.js + server/ + scripts/）是自包含的：拷到 ZCode 用户级 `~/.zcode/skills/testroute/`、项目级 `.zcode/skills/testroute/`、Claude Code `.claude/skills/testroute/` 即生效；不支持 skill 机制的宿主把本文件正文贴进规则文件，同时把目录留在任意固定路径并让 LLM 知道路径即可。仓库内更新引擎代码后重跑 `node scripts/build-skill.mjs` 重新同步。
+
+**版本锚（多宿主副本防漂移）**：每个引擎构建都带版本号 + 构建时间戳——`cli.js` 启动时在 stderr 打印 `[testroute] testroute v<版本> build <时间戳>`，`cli.js --version` 可直接查询；该锚随每条结果（result.json 的 `engine` 字段）、manifest init 事件、get_route 摘要与最终报告头部落档。多宿主副本（.zcode/.cursor/.vulcan/.claude）由 build 脚本一次性同步；**开工前看一眼启动横幅或 `--version`，发现各宿主版本不一致 = 旧副本还在被执行**（旧引擎缺新门禁，会做出已废弃的行为），先重新 build 同步再开跑。报告头部与归档里的版本锚也是事后取证手段：出问题时能确定当时执行的是哪个构建。

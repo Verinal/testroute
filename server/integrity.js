@@ -15,9 +15,10 @@ import { readJson } from './paths.js';
 
 // manifest 事件词表（与写入端一致；新增事件类型时此处必须同步）
 const EVENT_TYPES = new Set([
-  'init', 'gitignore', 'scan', 'save-route', 'approve', 'route-reset',
+  'init', 'gitignore', 'scan', 'save-route', 'approve', 're-approve', 'route-reset',
   'phase', 'triage-carry', 'run', 'run-complete', 'snapshot', 'probe',
   'triage', 'provision', 'record-change', 'testgate-ack', 'finalize',
+  'fingerprint-loop-override',
 ]);
 
 // 阶段状态词表（route.json 与 phase 事件共用）

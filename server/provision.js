@@ -9,6 +9,7 @@ import { fail } from './validate.js';
 import { readJson, writeJson, nowIso, archivesDir } from './paths.js';
 import { playwrightVersionFromNodeModules, nodeProjectDirs } from './detect.js';
 import { runCommand } from './run.js';
+import { loadRoute } from './route.js';
 
 export const PROVISION_FILE = 'provision.json';
 export const PROVISION_SCHEMA_VERSION = 1;
@@ -183,6 +184,41 @@ export function checkPlaywrightReady(root) {
         : []),
     ],
   };
+}
+
+// ---------- 依赖计划前置 ----------
+// save_route 按路线执行器自动推导「本次测试需要为项目安装的依赖」，存进 route.provisionPlan，
+// 随批准摘要一次性征得用户同意——用户批准路线=批准依赖计划；运行中 provision_deps 对计划内
+// 依赖不再发问（preConsented=true）。计划外依赖（规划时预见不了的）才允许运行时征询。
+export function computeProvisionPlan(route, root) {
+  const needsPlaywright = (route?.phases || []).some((p) => p.kind !== 'manual' && p.executor === 'playwright');
+  if (!needsPlaywright) return [];
+  const ready = checkPlaywrightReady(root);
+  return [
+    {
+      id: 'playwright',
+      packages: ['playwright'],
+      needed: !ready.ready,
+      reason: 'browser-e2e 等 playwright 执行器阶段生成的浏览器用例须在项目内解析 @playwright/test（可进项目 CI 复跑）',
+      status: ready.ready
+        ? `已就绪（包可解析，浏览器来源：${ready.browserSource}），无需安装`
+        : '未就绪：批准路线即同意按 provision_deps 计划安装（devDependency 写入 package.json，PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 不下载浏览器，浏览器按「编辑器内置 CDP > 系统 Chrome/Edge > chromium 缓存 > 下载（永远最后手段）」优先级获取）',
+    },
+  ];
+}
+
+// provision_deps 用：请求的包是否落在已批准路线的 provisionPlan 内（批准摘要已征得用户同意）
+export function preConsentedByRoute(archiveDir, packages) {
+  try {
+    const rt = loadRoute(archiveDir);
+    const plan = Array.isArray(rt?.provisionPlan) ? rt.provisionPlan : [];
+    return (
+      rt?.status === 'approved' &&
+      plan.some((e) => Array.isArray(e?.packages) && packages.every((p) => e.packages.includes(p)))
+    );
+  } catch {
+    return false; // 无路线 / 未批准 / 损坏 → 一律按计划外处理
+  }
 }
 
 function gitPorcelain(root) {
@@ -404,13 +440,17 @@ export async function provisionDeps(root, archiveDir, { packages = ['playwright'
   if (!plan.ok) fail('E_GATE', plan.reason);
 
   if (!confirm) {
+    const preConsented = preConsentedByRoute(archiveDir, packages);
     return {
       status: 'consent-required',
+      preConsented,
       readiness,
       plan,
       message:
         `需要用户同意后才能向项目安装依赖（写入 package.json；浏览器按「编辑器内置（CDP）> 系统 Chrome/Edge > chromium 缓存 > 下载」优先级获取，默认不下载）。` +
-        `请向用户展示 plan（将执行的命令与影响），用户同意后带 confirm=true 重新调用。`,
+        (preConsented
+          ? `该依赖已随路线批准（route.provisionPlan，批准摘要已征得用户同意）：向用户展示本计划留痕后直接 confirm=true 重新调用，不再发问。`
+          : `该依赖不在已批准路线的 provisionPlan 内（计划外依赖）：向用户展示 plan（将执行的命令与影响），征得同意后带 confirm=true 重新调用。`),
     };
   }
 

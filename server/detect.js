@@ -391,14 +391,19 @@ const ROUTE_PATH_RE = /\bpath\s*[:=]\s*["'`]([^"'`\n]+)["'`]/g;
 
 export function scanWebSurface(root, relFiles) {
   const pages = new Map();
-  const sources = new Set();
   let read = 0;
-  const addPage = (rawPath, file, source) => {
+  // pages/views 目录约定先暂存（defer）：目录里的 modal/子组件会被目录约定误判成页面，
+  // 等路由表解析完按「是否被路由 import 引用」过滤后再落榜（路由表 ≥3 页时才过滤）。
+  const pagesDirEntries = [];
+  const addPage = (rawPath, file, source, defer = false) => {
     const norm = normalizePagePath(rawPath);
     if (!norm || norm === '/*') return;
     if (pages.size >= WEBSURFACE_MAX_PAGES) return;
+    if (defer) {
+      if (pages.size + pagesDirEntries.length < WEBSURFACE_MAX_PAGES) pagesDirEntries.push({ path: norm, file, source });
+      return;
+    }
     if (!pages.has(norm)) pages.set(norm, { path: norm, file, source });
-    sources.add(source);
   };
 
   for (const rel of relFiles) {
@@ -420,7 +425,7 @@ export function scanWebSurface(root, relFiles) {
         if (rest.some((s) => s === 'api' || /^_(app|document|layout|error|loader)$/.test(s))) continue;
         const base = rest[rest.length - 1].replace(/\.(tsx|jsx|vue|svelte)$/i, '');
         const segs = [...rest.slice(0, -1), ...(base === 'index' ? [] : [base])];
-        addPage('/' + segs.join('/'), rel, `${pagesM[1]}-dir`);
+        addPage('/' + segs.join('/'), rel, `${pagesM[1]}-dir`, true);
       }
       continue;
     }
@@ -434,7 +439,10 @@ export function scanWebSurface(root, relFiles) {
     }
   }
 
-  // 4) 路由文件解析（React/Vue 路由表里的绝对路径声明）：只读候选文件名/router 目录，读前先查线索
+  // 4) 路由文件解析（React/Vue 路由表里的路径声明）：只读候选文件名/router 目录，读前先查线索。
+  // 嵌套路由的相对子段（react-router: 父 path="/" 内的 path="home"）挂到最近一个已声明的绝对
+  // 父路径下组合——SPA 手写路由里这是常态，只认绝对路径会把真实页面漏光。
+  let lastAbs = null;
   for (const rel of relFiles) {
     if (read >= 60 || pages.size >= WEBSURFACE_MAX_PAGES) break;
     if (!/\.[cm]?[jt]sx?$/i.test(rel) && !/\.vue$/i.test(rel)) continue;
@@ -447,10 +455,28 @@ export function scanWebSurface(root, relFiles) {
       read++;
       if (!ROUTER_INDICATOR_RE.test(content)) continue;
       for (const m of content.matchAll(ROUTE_PATH_RE)) {
-        addPage(m[1], rel, 'router-config');
+        const raw = m[1];
+        if (raw.startsWith('/')) {
+          addPage(raw, rel, 'router-config');
+          const norm = normalizePagePath(raw);
+          if (norm) lastAbs = norm;
+        } else if (lastAbs) {
+          addPage(lastAbs.replace(/\/+$/, '') + '/' + raw, rel, 'router-config');
+        }
       }
     } catch {
       /* 读不了就跳过 */
+    }
+  }
+
+  // 5) pages/views 目录条目落榜：路由表已给出 ≥3 个页面时，目录约定整体让位——手写 SPA 的
+  // components/pages/ 目录里文件名≠路由（HomePage 的真实路由是 /home），按文件名派生的路径
+  // 只会造出假页面（真实案例：16 个组件/弹窗被当成页面，全靠豁免表遮盖）。
+  // 路由表缺失或解析不动（<3 页）时目录约定全量保留（Next pages / Nuxt 的文件即路由）。
+  const routerPageCount = [...pages.values()].filter((e) => e.source === 'router-config').length;
+  if (routerPageCount < 3) {
+    for (const entry of pagesDirEntries) {
+      if (!pages.has(entry.path)) pages.set(entry.path, entry);
     }
   }
 
@@ -459,7 +485,7 @@ export function scanWebSurface(root, relFiles) {
     schemaVersion: 1,
     total: list.length,
     pages: list,
-    sources: [...sources],
+    sources: [...new Set(list.map((e) => e.source))],
     scannedAt: new Date().toISOString(),
   };
 }

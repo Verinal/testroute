@@ -4,11 +4,17 @@ import fs from 'node:fs';
 import { fail, truncate } from './validate.js';
 import { readJson, writeJson, nowIso } from './paths.js';
 import { verifyTestGate, acknowledgeTestGate, gateViolationError } from './testgate.js';
-import { STAGE_CATALOG } from './stages.js';
+import { STAGE_CATALOG, knownStageIds } from './stages.js';
+import { loadApiSurface } from './apimap.js';
+import { detectFrontend, loadWebSurface } from './detect.js';
+import { hasTrackedChanges } from './git.js';
+import { failureFingerprint } from './result.js';
+import { engineIdentity } from './version.js';
 
 export const ROUTE_FILE = 'route.json';
 
 export const ROUTE_MODES = ['generate-only', 'generate-and-execute'];
+export const ROUTE_SCOPES = ['full', 'targeted'];
 export const ROUTE_STATUSES = ['draft', 'approved', 'in-progress', 'completed', 'aborted', 'abandoned'];
 export const PHASE_KINDS = ['planning', 'generate', 'execute', 'manual'];
 export const EXECUTOR_IDS = ['vitest', 'jest', 'pytest', 'generic', 'health', 'sca', 'e2e', 'playwright', 'secrets', 'security-probe'];
@@ -92,6 +98,9 @@ export function summarizeRoute(route) {
   return {
     mode: route.mode,
     status: route.status,
+    scope: route.scope || null,
+    userRequest: route.userRequest ? truncate(route.userRequest, 200) : null,
+    engine: engineIdentity(),
     terminated: route.terminated || null,
     phaseCount: phases.length,
     phases,
@@ -131,6 +140,11 @@ export function validateRoute(route) {
     push('project 必须是 object（至少含 name）');
   } else if (typeof route.project.name !== 'string' || !route.project.name.trim()) {
     push('project.name 必须是非空 string');
+  }
+  // 用户原话（范围对照锚）：不强制 scope 收窄，但强制「用户怎么说的」进归档——批准摘要与最终报告
+  // 都以它做范围对照，"用户要 A+B、路线测了 12 个阶段"这类扩张至少必须发生在用户眼前。
+  if (typeof route.userRequest !== 'string' || !route.userRequest.trim()) {
+    push('userRequest 必填：用户对本次测试请求的原话（逐字引用，不改写、不概括、不翻译）——批准摘要与最终报告以此做范围对照');
   }
 
   const phases = route.phases;
@@ -316,6 +330,48 @@ export function validateRoute(route) {
     }
   }
 
+  // scope（全流程 vs 定向）：缺省由 save_route 自动置 "full"——专家级齐全测试是本 skill 的默认契约，
+  // 不依赖 LLM 自觉；"targeted"（单独测某个阶段/某类）是显式选择，必须留一句理由进归档。
+  // 旧归档（无 scope 字段）不回溯：全流程门禁只在 scope === "full" 时生效。
+  if (route.scope !== undefined) {
+    if (!ROUTE_SCOPES.includes(route.scope)) {
+      push(`scope 必须是 [${ROUTE_SCOPES.join(' | ')}] 之一（缺省 full；targeted=只测部分阶段，须附 scopeReason 留痕）`);
+    }
+    if (route.scope === 'targeted' && (typeof route.scopeReason !== 'string' || !route.scopeReason.trim())) {
+      push('scope="targeted"（只测部分阶段）必须附非空 scopeReason（一句话说明为何不做全流程，进归档留痕）');
+    }
+  }
+
+  // 全流程豁免：scope=full 时逐阶段放弃强制集的逃生阀（mirror coverageWaiver 的留痕风格）。
+  // 豁免是逐项、留痕、有理由的例外——须先向用户确认；整条路线不测完收工不被允许。
+  if (route.fullFlowWaiver !== undefined) {
+    const w = route.fullFlowWaiver;
+    if (!Array.isArray(w) || w.length === 0) {
+      push('fullFlowWaiver 必须是非空 array（逐项 { phase, reason }，phase 为标准阶段 id）');
+    } else {
+      const seen = new Set();
+      w.forEach((item, i) => {
+        const at = `fullFlowWaiver[${i}]`;
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+          push(`${at} 必须是 object`);
+          return;
+        }
+        if (typeof item.phase !== 'string' || !item.phase.trim()) {
+          push(`${at}.phase 必须是非空 string（标准阶段 id）`);
+        } else if (!knownStageIds().includes(item.phase)) {
+          push(`${at}.phase "${item.phase}" 不是标准阶段 id（可选: ${knownStageIds().join('、')}）`);
+        } else if (seen.has(item.phase)) {
+          push(`${at}.phase "${item.phase}" 重复（一个阶段一条豁免）`);
+        } else {
+          seen.add(item.phase);
+        }
+        if (typeof item.reason !== 'string' || !item.reason.trim()) {
+          push(`${at}.reason 必须是非空 string（豁免理由留痕，报告会原样引用）`);
+        }
+      });
+    }
+  }
+
   if (issues.length > 0) {
     fail('E_INVALID_ROUTE', `route.json 校验失败（共 ${issues.length} 处）:\n- ` + issues.join('\n- '));
   }
@@ -409,6 +465,230 @@ export function enforceDepthPolicyOnApprove(route, apiSurface) {
         `用户明确要求裁剪时，先向其确认，再在 route.depthWaiver 写入 { reason: "<裁剪理由>" } 后重新批准。`
     );
   }
+}
+
+// ---------- 全流程强制集政策（scope=full）----------
+// 「任何 AI 用这个 skill 做全流程测试，产出的都是专家级齐全的路线」不能靠 SKILL.md 劝说——
+// 这里把强制集变成引擎门禁：scope=full 的路线缺任何适用阶段，approve 直接拦下，列明缺口与出路。
+// 单独测某个阶段仍允许：显式 scope="targeted" + scopeReason 留痕（validateRoute 强制）。
+// 条件判定用 stages.js 的 fullFlow 标签 + fullFlowContext 算出的上下文（盘点/前端/git 脏区），
+// 条件不满足的阶段自动不要求；resilience/chaos/pentest/canary/dast 永不强制（opt-in）。
+
+// 浏览器 E2E 最低流程级用例数：max(4, ceil(页面盘点数/4))；页面盘点拿不到时 fallback 4。
+// 每条流程级用例覆盖一个完整业务流（登录登出、核心模块 UI CRUD、异步生成等待、表单错误态），
+// 页面走查最多算 1 条——「1 条走查用例过关」在 scope=full 下不可能再发生。
+export function browserE2eMinCases(pagesTotal) {
+  const n = Number(pagesTotal);
+  if (!Number.isFinite(n) || n <= 0) return 4;
+  return Math.max(4, Math.ceil(n / 4));
+}
+
+// 浏览器 E2E 流程基线（scope=full）：从项目盘点推导「必测业务流清单」——登录登出 + 每模块 UI CRUD
+// + 表单错误态。深度门禁由清单驱动而非纯公式：最低用例数 = max(公式下限, 流程数)；passed 前逐条
+// 对账（用例标题带 @flow:<id> 标签，纯页面走查没有标签、对不上账）。清单随 save_route 响应返回，
+// 进批准摘要给用户评审——测什么业务流不靠 LLM 现场发挥，也不靠用户事后抽查。
+export function browserE2eFlowBaseline(apiSurface, pagesTotal) {
+  const flows = [];
+  if ((apiSurface?.protectedCount ?? 0) > 0) {
+    flows.push({ id: 'auth', why: '登录→核心操作→登出（含登出后访问受保护页跳回登录、服务端会话失效）' });
+  }
+  // modules 形如 [{ name, file, count }]（容错兼容纯 string）
+  const modules = Array.isArray(apiSurface?.modules)
+    ? apiSurface.modules.map((m) => (typeof m === 'string' ? m : m?.name)).filter((m) => typeof m === 'string' && m.trim())
+    : [];
+  for (const m of modules) {
+    flows.push({ id: `crud-${m}`, why: `模块 "${m}" 的 UI 增删改查主流程` });
+  }
+  flows.push({ id: 'form-error', why: '表单错误态：必填缺失/非法输入的前端拦截与错误提示流程' });
+  return {
+    flows,
+    minCases: Math.max(browserE2eMinCases(pagesTotal), flows.length),
+  };
+}
+
+// 全流程门禁上下文：盘点（apiSurface）、前端标志、页面盘点（pages）、git 脏区。
+// save_route 与 finalize_report 共用，保证 approve 拦截口径与报告对照口径一致。
+export function fullFlowContext(root, archiveDir) {
+  const apiSurface = loadApiSurface(root, archiveDir);
+  let frontend = false;
+  try {
+    frontend = detectFrontend(root).detected === true;
+  } catch {
+    frontend = false;
+  }
+  // project-map.json 是 scan_project 的落盘产物，优先取（避免重复扫描）；缺失/损坏才以现场探测为准
+  let pages = null;
+  try {
+    const map = readJson(path.join(archiveDir, 'project-map.json'));
+    if (map?.frontend?.detected === true) frontend = true;
+    if (map?.webSurface?.pages) pages = map.webSurface;
+  } catch {
+    /* 地图缺失 → 用上面的现场探测结果 */
+  }
+  if (!pages) {
+    try {
+      pages = loadWebSurface(root, archiveDir);
+    } catch {
+      pages = null;
+    }
+  }
+  // git 脏区：untracked 不计；排除 test-archives/**（本归档产物）与 provision 台账路径
+  //（依赖安装自己改动的 package.json/锁文件——playwright 安装不应触发 regression 强制）
+  const exclude = [];
+  try {
+    const ledger = readJson(path.join(archiveDir, 'provision.json'));
+    for (const m of ledger?.modifications || []) if (m?.path) exclude.push(String(m.path));
+    if ((ledger?.installs || []).length > 0) {
+      for (const name of ['package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'bun.lock']) {
+        exclude.push(name);
+      }
+    }
+  } catch {
+    /* 无台账 → 无需排除 */
+  }
+  let gitDirty = false;
+  try {
+    gitDirty = hasTrackedChanges(root, exclude);
+  } catch {
+    gitDirty = false;
+  }
+  return { apiSurface, frontend, pages, pagesTotal: pages?.total ?? null, gitDirty };
+}
+
+function fullFlowConditionMet(cond, route, ctx) {
+  const conn = (route.phases || []).find((p) => p?.id === 'connectivity');
+  const hasTargets = Array.isArray(conn?.targets) && conn.targets.length > 0;
+  const apiTotal = ctx?.apiSurface?.total ?? 0;
+  const isApi = apiTotal >= API_DEPTH_THRESHOLD;
+  const conds = Array.isArray(cond) ? cond : [cond];
+  return conds.every((c) => {
+    switch (c) {
+      case 'always':
+        return true;
+      case 'service':
+        return hasTargets || isApi;
+      case 'api':
+        return isApi;
+      case 'api-multi-module':
+        return isApi && (ctx?.apiSurface?.modules?.length ?? 0) >= 2;
+      case 'openapi':
+        return (ctx?.apiSurface?.sources || []).some((s) => /openapi/i.test(String(s)));
+      case 'frontend':
+        return ctx?.frontend === true;
+      case 'git-dirty':
+        return ctx?.gitDirty === true;
+      case 'authz-needed':
+        return (ctx?.apiSurface?.protectedCount ?? 0) > 0 || (apiTotal > 0 && (ctx?.apiSurface?.publicCount ?? 0) === 0);
+      case 'never':
+        return false;
+      default:
+        return false;
+    }
+  });
+}
+
+const FULL_FLOW_WHY = {
+  always: '恒必需（专家级全流程的基本盘）',
+  service: '有可测服务（connectivity targets 已知或 API 项目）',
+  api: 'API 项目（盘点端点达标）',
+  'api-multi-module': 'API 项目且盘点到多个模块',
+  openapi: '盘点到机器可读契约（openapi/swagger）',
+  frontend: '前端项目',
+  'git-dirty': 'git 工作区有真实源码变更',
+  'authz-needed': '盘点到受保护端点',
+};
+
+// scope=full 的强制集对照：required（条件适用且必需）/ present / missing / waived / skipped。
+// 条件不满足的进 inapplicable（informational，不拦）；fullFlow='never' 的进 optional（保持 opt-in）。
+export function fullFlowCoverage(route, ctx = null) {
+  const scope = route.scope === 'targeted' ? 'targeted' : 'full';
+  const ids = (route.phases || []).map((p) => p?.id);
+  const waiverByPhase = new Map();
+  for (const w of Array.isArray(route.fullFlowWaiver) ? route.fullFlowWaiver : []) {
+    if (w?.phase && !waiverByPhase.has(w.phase)) waiverByPhase.set(w.phase, String(w.reason || ''));
+  }
+  const required = [];
+  const present = [];
+  const missing = [];
+  const waived = [];
+  const skipped = [];
+  const inapplicable = [];
+  const optional = [];
+  for (const meta of STAGE_CATALOG) {
+    const cond = meta.fullFlow || 'never';
+    if (cond === 'never') {
+      optional.push(meta.id);
+      continue;
+    }
+    const conds = Array.isArray(cond) ? cond : [cond];
+    if (!fullFlowConditionMet(cond, route, ctx)) {
+      inapplicable.push({ id: meta.id, condition: conds.join('+'), why: conds.map((c) => FULL_FLOW_WHY[c]).filter(Boolean).join(' 且 ') });
+      continue;
+    }
+    const entry = { id: meta.id, title: meta.title, group: meta.group, condition: conds.join('+'), why: conds.map((c) => FULL_FLOW_WHY[c]).filter(Boolean).join(' 且 ') };
+    required.push(entry);
+    if (ids.includes(meta.id)) {
+      const p = route.phases.find((x) => x?.id === meta.id);
+      if (p.status === 'skipped') skipped.push({ id: meta.id, reason: p.reason || '' });
+      else present.push(meta.id);
+    } else if (waiverByPhase.has(meta.id)) {
+      waived.push({ id: meta.id, reason: waiverByPhase.get(meta.id) });
+    } else {
+      missing.push(entry);
+    }
+  }
+  return {
+    scope,
+    required,
+    present,
+    missing,
+    waived,
+    skipped,
+    inapplicable,
+    optional,
+    counts: { required: required.length, present: present.length, missing: missing.length, waived: waived.length },
+  };
+}
+
+// 批准检查点（第三道）：scope=full 的路线必须覆盖全部条件适用的阶段，缺一即拦。
+// 三条出路：补阶段 / 条件不满足时修正判断依据重判 / 用户确认后逐项 fullFlowWaiver 留痕。
+export function enforceFullFlowPolicyOnApprove(route, ctx = null) {
+  if (route.mode !== 'generate-and-execute') return;
+  if (route.scope === 'targeted') return; // 定向测试已在 validateRoute 强制 scopeReason 留痕，放行
+  const cov = fullFlowCoverage(route, ctx);
+  if (!cov.missing.length) return;
+  fail(
+    'E_GATE',
+    `路线为全流程（scope=full），但缺少 ${cov.missing.length} 个必需阶段:\n- ` +
+      cov.missing.map((m) => `${m.id}（${m.group}层 · 纳入原因: ${m.why}）`).join('\n- ') +
+      `\n全流程 = 专家级齐全测试：条件适用的阶段一项都不能少（条件不满足的自动不要求）。出路三选一:\n` +
+      `① 重新 save_route 把这些阶段补进路线（uat 为 manual 阶段会自动注入；load/stress/soak 耗时长可放宽强度，但不可缺席）；\n` +
+      `② 某项的纳入条件其实不满足（如并非 API 项目/无前端/工作区干净）→ 说明实情后重新 save，引擎按条件重判（不要硬凑不存在的条件）；\n` +
+      `③ 用户明确确认裁剪某阶段 → 先向用户确认，再在 route.fullFlowWaiver 逐项写 { phase: "<阶段id>", reason: "<理由>" } 留痕后重新批准` +
+      `（禁止为省事默认 targeted；禁止整条路线不测完收工）。`
+  );
+}
+
+// 全流程默认覆盖（save_route 调用，mirror injectSecurityDefaults）：scope=full 且缺 uat 且未豁免 → 自动补
+// uat（manual 阶段、无执行器、不执行任何命令，安全）。其余必需阶段不自动注入：执行器选择依赖项目栈
+//（k6/JMeter/pytest…），由 LLM 补齐 + approve 门禁兜底；只有 manual 的 uat 能安全地自动补。
+export function injectFullFlowDefaults(route) {
+  if (!route || route.mode !== 'generate-and-execute' || !Array.isArray(route.phases)) return [];
+  if (route.scope === 'targeted') return [];
+  if ((Array.isArray(route.fullFlowWaiver) ? route.fullFlowWaiver : []).some((w) => w?.phase === 'uat' && String(w?.reason || '').trim())) return [];
+  if (route.phases.some((p) => p?.id === 'uat')) return [];
+  const meta = STAGE_BY_ID.get('uat');
+  const phase = {
+    id: 'uat',
+    kind: meta.defaultKind,
+    status: 'pending',
+    onFailure: meta.defaultOnFailure,
+    notes: `默认全流程覆盖（save_route 自动补齐，非 LLM 规划）：${meta.title}——${meta.essence}。产出验收清单到 manual-cases/，由业务方执行；用户明确不要时先向其确认，再移除本阶段并用 fullFlowWaiver 留痕`,
+  };
+  const acceptIdx = route.phases.findIndex((p) => STAGE_BY_ID.get(p?.id)?.group === '验收');
+  if (acceptIdx === -1) route.phases.push(phase);
+  else route.phases.splice(acceptIdx, 0, phase);
+  return ['uat'];
 }
 
 // ---------- 落地规范（save_route 调用；不依赖 LLM 服从性）----------
@@ -616,7 +896,7 @@ export function updatePhase(archiveDir, { phaseId, status, reason, notes, allowT
             fail(
               'E_GATE',
               `阶段 "${phaseId}" 最近一次执行未通过（exitCode=${run.exitCode}, 失败用例=${run.summary?.failed ?? '?'}）。` +
-                `请先 record_triage 归因并修复后重跑，或将阶段标记为 failed / skipped(reason)。`
+                `请先 record_triage 归因（test-bug→修沙箱内用例重跑；code-bug→阶段标 failed 并划 P0–P3，不修被测代码；environment→修环境重跑），或将阶段标记为 failed / skipped(reason)。`
             );
           }
           phase.notes = appendNote(phase.notes, '[gate] 失败用例全部归因为环境问题，允许通过');
@@ -642,6 +922,87 @@ export function updatePhase(archiveDir, { phaseId, status, reason, notes, allowT
                   `处理：① 查 run warnings 与 runs/${run.runId}/raw/artifacts/（video/自动截图由工具注入的证据 wrapper 提供，--trace on 由命令兜底）；\n` +
                   `② 环境确实产不出（如 ffmpeg 缺失）→ run_tests(evidence="trace", evidenceReason=…) 降级重跑；\n` +
                   `③ 用户明写不要证据 → run_tests(evidence="off", evidenceReason=…)（留痕，最终报告如实标注）。`
+              );
+            }
+          }
+        }
+        // 用例级结果门禁（generic 执行器）：只有 exit code / 汇总行、解析不出任何具名用例的 run，
+        // 不许以 passed 收口——"passed 但报告里无用例级结果"是报告失信的直接来源
+        //（真实事故：整份报告一排「无用例级结果」，读者无从核对到底测了什么）。
+        if (phase.executor === 'generic') {
+          let caseCount = 0;
+          try {
+            const { result: rr } = findRunResultPath(archiveDir, run.runId);
+            caseCount = (rr?.suites || []).reduce((n, s) => n + (s.cases?.length || 0), 0);
+          } catch {
+            caseCount = 0;
+          }
+          if (caseCount === 0) {
+            fail(
+              'E_GATE',
+              `阶段 "${phaseId}" 最近一次 generic run 没有任何用例级结果（只有 exit code 或汇总行数字）——「passed 但无用例明细」不可收口。\n` +
+                `修沙箱脚本二选一后重跑：① 逐用例写环境变量 TESTROUTE_RESULTS_FILE 指向的文件（JSON 数组，元素 {name, status: "passed"|"failed"|"skipped", message?}）；\n` +
+                `② 逐行输出 "PASS | 用例名" / "FAIL | 用例名"（也认 "ok - " / "not ok - "）。逐用例结果会进最终报告的「全量用例清单」，无明细 = 报告失信。`
+            );
+          }
+        }
+        // ① 数量：最低数 = max(4, ceil(页面盘点数/4), 流程基线数)，页面盘点拿不到时公式下限 4；
+        // ② 对账：盘点推导的必测业务流（登录登出/每模块 UI CRUD/表单错误态）逐项要有带
+        //    @flow:<id> 标题标签的用例——纯页面走查没有标签，对不上账。
+        // fullFlowWaiver（phase: browser-e2e）整体留痕可豁免两项。
+        if (route.scope === 'full' && phase.executor === 'playwright') {
+          const waivedMin = (Array.isArray(route.fullFlowWaiver) ? route.fullFlowWaiver : []).some(
+            (w) => (w?.phase === phase.id || w?.phase === 'browser-e2e') && String(w?.reason || '').trim()
+          );
+          let pagesTotal = null;
+          try {
+            pagesTotal = loadWebSurface(route.project?.root, archiveDir)?.total ?? null;
+          } catch {
+            pagesTotal = null;
+          }
+          let ffApiSurface = null;
+          try {
+            ffApiSurface = loadApiSurface(route.project?.root, archiveDir);
+          } catch {
+            ffApiSurface = null;
+          }
+          const baseline = browserE2eFlowBaseline(ffApiSurface, pagesTotal);
+          const caseTotal = run.summary?.total;
+          if (!waivedMin && !(Number.isFinite(caseTotal) && caseTotal >= baseline.minCases)) {
+            fail(
+              'E_GATE',
+              `阶段 "${phaseId}" 全流程深度门禁未达标（scope=full）：浏览器 E2E 至少 ${baseline.minCases} 条流程级用例` +
+                `${pagesTotal != null ? `（页面盘点 ${pagesTotal} 页、流程基线 ${baseline.flows.length} 条 → max(4, ceil(${pagesTotal}/4), ${baseline.flows.length})）` : '（页面盘点不可得，取公式下限与流程基线的较大值）'}，` +
+                `最近一次 run 解析到 ${Number.isFinite(caseTotal) ? caseTotal : 0} 条。\n` +
+                `每条流程级用例覆盖一个完整业务流（登录登出、核心模块 UI 增删改查、异步生成等待、表单错误态）；页面走查最多算 1 条。\n` +
+                `出路：① 补流程级用例后重跑（生成用例前先 browser_probe 抓真实 DOM）；` +
+                `② 用户明确确认裁剪 → 在 route.fullFlowWaiver 写 { phase: "browser-e2e", reason: "<理由>" } 留痕后重新保存路线。`
+            );
+          }
+          if (!waivedMin && Number.isFinite(caseTotal) && caseTotal > 0) {
+            const tagged = new Set();
+            try {
+              const { result: rr } = findRunResultPath(archiveDir, run.runId);
+              for (const suite of rr?.suites || []) {
+                for (const c of suite.cases || []) {
+                  const re = /@flow:([^\s›]+)/g;
+                  let m;
+                  while ((m = re.exec(String(c?.name || '')))) tagged.add(m[1]);
+                }
+              }
+            } catch {
+              // 结果不可读 → 视为无标签，对账拦下（诚实优先）
+            }
+            const missingFlows = baseline.flows.filter((f) => !tagged.has(f.id));
+            if (missingFlows.length) {
+              fail(
+                'E_GATE',
+                `阶段 "${phaseId}" 全流程浏览器 E2E 基线对账未过（scope=full）：以下必测业务流没有任何带 @flow:<id> 标签的用例——` +
+                  missingFlows.map((f) => `${f.id}（${f.why}）`).join('、') + `。\n` +
+                  `流程清单由项目盘点推导（登录登出/每模块 UI CRUD/表单错误态），随 save_route 响应的 browserE2eFlowBaseline 返回；` +
+                  `每条用例标题末尾加 "@flow:<id>"（如 "注册登录主流程 @flow:auth"），纯页面走查没有标签、对不上账。\n` +
+                  `出路：① 按清单补对应用例后重跑（生成用例前先 browser_probe 抓真实 DOM）；` +
+                  `② 用户明确确认裁剪 → 在 route.fullFlowWaiver 写 { phase: "browser-e2e", reason: "<理由>" } 留痕后重新保存路线。`
               );
             }
           }
@@ -734,13 +1095,92 @@ function propagate(route, failedIdx, outcome) {
   return propagated;
 }
 
+// 失败判定统一口径：run 状态失败 / 退出码非 0 / 解析出失败用例，三者任一即视为失败 run。
+export function isFailedRun(run) {
+  if (!run) return false;
+  return run.status === 'failed' || run.exitCode !== 0 || (run.summary?.failed ?? 0) > 0;
+}
+
+// route-reset 会清掉 phase.runs 但保留 runs/ 目录文件——执行历史的权威来源是磁盘。
+// route 内引用 + 磁盘 run 合并（按 runId 去重、按时间排序）：归因继承、重跑门禁、收口计数
+// 都必须看全量历史，否则 reset 一次就绕过一轮归因。
+export function listDiskRuns(archiveDir, phaseId = null) {
+  const runsDir = path.join(archiveDir, 'runs');
+  if (!fs.existsSync(runsDir)) return [];
+  const out = [];
+  for (const name of fs.readdirSync(runsDir)) {
+    const resultPath = path.join(runsDir, name, 'result.json');
+    if (!fs.existsSync(resultPath)) continue;
+    const result = readJson(resultPath);
+    if (!result?.runId) continue;
+    if (phaseId && result.phaseId !== phaseId) continue;
+    out.push({
+      runId: result.runId,
+      resultPath: toPosixRunRef(result.runId),
+      status: result.status,
+      exitCode: result.exitCode,
+      parseStatus: result.parseStatus || null,
+      command: result.command || null,
+      summary: result.summary || null,
+      triage: result.triage || null,
+      // 未归因 run 的 result.json 不存指纹（指纹只在 record_triage 时落盘）——现场重算，
+      // 否则 route-reset 后磁盘上的未归因失败 run 没有指纹，继承与收口计数都失明。
+      fingerprint: result.triage?.fingerprint || result.fingerprint || failureFingerprint(result) || null,
+      git: result.git || null,
+      coverage: null,
+      startedAt: result.startedAt || '',
+      finishedAt: result.finishedAt || '',
+      durationMs: result.durationMs ?? null,
+      _fromDisk: true,
+    });
+  }
+  out.sort((a, b) => String(a.startedAt || a.finishedAt).localeCompare(String(b.startedAt || b.finishedAt)));
+  return out;
+}
+
+function toPosixRunRef(runId) {
+  return `runs/${runId}/result.json`;
+}
+
+export function mergedPhaseRuns(archiveDir, phase) {
+  const disk = new Map();
+  for (const r of listDiskRuns(archiveDir, phase.id)) disk.set(r.runId, r);
+  const known = new Map();
+  for (const r of Array.isArray(phase.runs) ? phase.runs : []) {
+    if (!r?.runId) continue;
+    const d = disk.get(r.runId) || null;
+    // route 引用为主（coverage/evidenceGate 等 route 侧注解），磁盘回填引用里缺的事实字段
+    //（serializeRunRef 不存时间——没有回填，route-reset 后重新引用的 run 会因空时间排错序）
+    known.set(r.runId, {
+      ...r,
+      ...(d
+        ? {
+            startedAt: r.startedAt || d.startedAt || '',
+            finishedAt: r.finishedAt || d.finishedAt || '',
+            triage: r.triage || d.triage || null,
+            fingerprint: r.fingerprint || d.fingerprint || null,
+            command: r.command || d.command || null,
+            durationMs: r.durationMs ?? d.durationMs ?? null,
+          }
+        : {}),
+    });
+  }
+  for (const [id, r] of disk) {
+    if (!known.has(id)) known.set(id, r);
+  }
+  return [...known.values()].sort((a, b) =>
+    String(a.startedAt || a.finishedAt).localeCompare(String(b.startedAt || b.finishedAt))
+  );
+}
+
 // 失败 run 未归因 → 禁止再次执行。没有这道门禁，"triage 里写已修"与"修复实际生效"之间的
 // 落差（重跑仍失败）会在归档里不可见——失败 run 必须逐次归因。
-export function requireTriageForRerun(phase) {
-  const run = lastRunOf(phase);
+// 视线覆盖 route-reset 前的磁盘历史：reset 清 phase.runs 不等于历史归因义务消失。
+export function requireTriageForRerun(archiveDir, phase) {
+  const runs = mergedPhaseRuns(archiveDir, phase);
+  const run = runs[runs.length - 1];
   if (!run) return;
-  const failed = run.status === 'failed' || run.exitCode !== 0 || (run.summary?.failed ?? 0) > 0;
-  if (failed && !run.triage) {
+  if (isFailedRun(run) && !run.triage) {
     fail(
       'E_TRIAGE_REQUIRED',
       `阶段 "${phase.id}" 上一次执行（${run.runId}）失败且未归因。请先 record_triage(runId="${run.runId}") ` +
@@ -749,20 +1189,25 @@ export function requireTriageForRerun(phase) {
   }
 }
 
-// 失败指纹继承：本次失败与上一轮已归因失败的指纹完全一致（同一批用例、同样报错前缀）→
-// 自动继承上轮归因并留痕（carriedFrom），宿主不再为同一失败重复交 record_triage 一轮。
+// 失败指纹继承：本次失败与历史已归因失败的指纹完全一致（同一批用例、同样报错前缀）→
+// 自动继承该轮归因并留痕（carriedFrom），宿主不再为同一失败重复交 record_triage 一轮。
 // 指纹不同（修复生效/新失败）照旧拦截。这是"逐次归因"的唯一放宽，全程留痕可审计。
+// 历史视线含 route-reset 前的磁盘 runs——reset 不重置归因义务，也不重置继承资格。
 export function maybeCarryOverTriage(archiveDir, route, phase) {
-  const runs = Array.isArray(phase.runs) ? phase.runs : [];
+  const runs = mergedPhaseRuns(archiveDir, phase);
   const last = runs[runs.length - 1];
   if (!last || last.triage) return null;
-  const failed = last.status === 'failed' || last.exitCode !== 0 || (last.summary?.failed ?? 0) > 0;
-  if (!failed || !last.fingerprint) return null;
+  if (!isFailedRun(last) || !last.fingerprint) return null;
   for (let i = runs.length - 2; i >= 0; i--) {
     const prev = runs[i];
     if (prev.triage && prev.fingerprint && prev.fingerprint === last.fingerprint) {
       last.triage = { ...prev.triage, carriedFrom: prev.runId, carriedAt: nowIso() };
       delete last.triage.updatedAt;
+      // route 内引用同步：last 可能只存在于磁盘（route-reset 后），把继承结果回写 route 引用，
+      // 保证 route.json 自身就完整记录该 run 与其归因（归档不依赖重新扫盘才可见）。
+      const ref = (phase.runs = Array.isArray(phase.runs) ? phase.runs : []).find((r) => r?.runId === last.runId);
+      if (ref) ref.triage = last.triage;
+      else phase.runs.push(serializeRunRef({ ...last, triage: last.triage }));
       try {
         const { resultPath, result } = findRunResultPath(archiveDir, last.runId);
         result.triage = last.triage;
@@ -778,13 +1223,34 @@ export function maybeCarryOverTriage(archiveDir, route, phase) {
   return null;
 }
 
-export function approveRoute(archiveDir, { apiSurface = null } = {}) {
+// 同指纹收口计数：从最近一次 run 往前数，连续失败且指纹完全一致的 run 数。
+// 同一失败指纹连续多轮＝宿主在原地打转（修了没生效/没修在重试）——达到阈值后 run_tests
+// 拒绝再跑，逼着换做法（改变用例/数据/环境使指纹变化）或如实归因收尾，不许无限重试。
+export function consecutiveSameFingerprintFailures(archiveDir, phase) {
+  const runs = mergedPhaseRuns(archiveDir, phase);
+  let end = runs.length - 1;
+  while (end >= 0 && !isFailedRun(runs[end])) end--;
+  if (end < 0) return { count: 0, fingerprint: null, runIds: [] };
+  const fp = runs[end].fingerprint;
+  if (!fp) return { count: 0, fingerprint: null, runIds: [] };
+  const runIds = [];
+  for (let i = end; i >= 0; i--) {
+    const r = runs[i];
+    if (!isFailedRun(r) || r.fingerprint !== fp) break;
+    runIds.unshift(r.runId);
+  }
+  // 锚定批次的命令：调用方可对比本次命令是否已换做法（换命令/换脚本 = 已按门禁指引调整，不再拦）
+  return { count: runIds.length, fingerprint: fp, runIds, command: runs[end]?.command ?? null };
+}
+
+export function approveRoute(archiveDir, { apiSurface = null, fullFlowCtx = null } = {}) {
   const route = loadRoute(archiveDir);
   if (route.status !== 'draft') {
     fail('E_GATE', `只有 draft 路线可以被 approve，当前状态: ${route.status}`);
   }
   enforceSecurityPolicyOnApprove(route, apiSurface);
   enforceDepthPolicyOnApprove(route, apiSurface);
+  enforceFullFlowPolicyOnApprove(route, fullFlowCtx);
   route.status = 'approved';
   route.approvedAt = nowIso();
   route.updatedAt = nowIso();
@@ -796,7 +1262,7 @@ export function computeNextActions(route) {
   const acts = [];
   if (route.terminated) {
     acts.push(
-      `链路已被阶段 "${route.terminated.byPhase}" 终止（${route.terminated.reason}）。修复后 update_phase(该阶段, status="in-progress") 解除终止并重跑，或废弃本次归档重新开始。`
+      `链路已被阶段 "${route.terminated.byPhase}" 终止（${route.terminated.reason}）。处置路径协议已定死，不询问用户：先 record_triage 归因（code-bug 必划 P0–P3）——test-bug/environment 是我方用例或环境问题，沙箱内修好后 update_phase(该阶段, status="in-progress") 解除终止并重跑；code-bug 是被测产品缺陷，绝不修产品代码：换用合法数据/绕开缺陷路径能让该阶段完成本职验证就调整沙箱内用例后解除终止重跑（缺陷本体安排在对应深度阶段如 negative 如实覆盖），核心流被阻断且无替代路径则直接 finalize_report 如实收尾（outcome=aborted，缺陷置顶）。禁止把"修不修/要不要继续/跳不跳过"编成选项抛给用户。`
     );
   }
   if (route.status === 'draft') {
@@ -808,13 +1274,13 @@ export function computeNextActions(route) {
   const allTerminal = route.phases.every((p) => TERMINAL.has(p.status));
 
   if (awaiting) {
-    acts.push(`阶段 "${awaiting.id}" 处于 awaiting-approval：把失败情况与选项呈现给用户，等待指示后 update_phase。`);
+    acts.push(`阶段 "${awaiting.id}" 处于 awaiting-approval：把失败情况如实呈现给用户并等待指示；呈现的选项不得包含"修复被测代码"（只测不修，修复建议写进 triage note 与最终报告即可）。`);
   }
   if (!route.terminated) {
     const blocked = route.phases.find((p) => p.status === 'blocked');
     if (blocked) {
       acts.push(
-        `阶段 "${blocked.id}" 被 block（${blocked.reason || '上游失败/跳过传播'}）。上游修复后 update_phase(phaseId="${blocked.id}", status="in-progress") 显式解锁。`
+        `阶段 "${blocked.id}" 被 block（${blocked.reason || '上游失败/跳过传播'}）。上游按失败归因协议处置（test-bug 修沙箱内用例复跑；code-bug 只记录划级、不修被测代码）后 update_phase(phaseId="${blocked.id}", status="in-progress") 显式解锁，处置全程不询问用户。`
       );
     }
   }

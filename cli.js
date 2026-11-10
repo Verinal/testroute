@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TOOL_DEFS, callTool } from './server/tools.js';
+import { engineLabel } from './server/version.js';
 
 const USAGE = `TestRoute CLI（零依赖，Node >=18）
 用法:
@@ -36,6 +37,7 @@ function parseArgv(argv) {
     else if (a === '--root') opts.root = argv[++i];
     else if (a === '--args') opts.args = argv[++i];
     else if (a === '--help' || a === '-h') opts.help = true;
+    else if (a === '--version' || a === '-v') opts.version = true;
     else if (!opts.tool && !a.startsWith('--')) opts.tool = a;
     else die(`未知参数: ${a}\n${USAGE}`);
   }
@@ -65,6 +67,14 @@ function readArgsJson(spec) {
 
 async function main() {
   const opts = parseArgv(process.argv.slice(2));
+
+  // 版本锚：每次调用都在 stderr 报引擎身份——多宿主拷贝漂移当场可见，不用等验尸
+  process.stderr.write(`[testroute] ${engineLabel()}\n`);
+
+  if (opts.version) {
+    process.stdout.write(`${engineLabel()}\n`);
+    return;
+  }
 
   if (opts.list) {
     for (const t of TOOL_DEFS) {

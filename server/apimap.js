@@ -347,10 +347,13 @@ export function coverageAgainstInventory(inventory, coveredKeys, { full = false 
     byModule.set(e.module, m);
   });
   const cap = full ? Infinity : 40;
+  // covered 按盘点条目数计（total - uncovered），不用 hit.size——盘点内近重复键（尾斜杠/同名参数
+  // 两种写法）会被 Set 去重，hit.size 少计成假缺口（真实案例：125 端点全测了却报 122/125）。
+  const coveredCount = inv.length - uncoveredPairs.length;
   return {
     total: inv.length,
-    covered: hit.size,
-    pct: Math.round((hit.size / inv.length) * 100),
+    covered: coveredCount,
+    pct: Math.round((coveredCount / inv.length) * 100),
     uncovered: uncoveredPairs.slice(0, cap),
     uncoveredTotal: uncoveredPairs.length,
     modules: [...byModule.values()].sort((a, b) => a.covered / a.total - b.covered / b.total),
@@ -408,6 +411,12 @@ export function coverageMatrix(inventory, kindCoverage) {
 // 接受字符串数组（"/login"）或对象数组（{path}）。默认按端点口径折叠（数字段 {p} + 小写）；
 // 传入 pageNormalize（detect.js 的 normalizePagePath）时按页面口径归一——页面路径大小写敏感，
 // 盘点（web-pages.json）与豁免匹配都走 normalizePagePath，上报侧必须同一把尺，否则 /HomePage 会变成 /homepage 对不上。
+//
+// 返回 { pages, unclean }：
+// - pages：规范路径（计入覆盖）；
+// - unclean：含 "//" 的路径段（典型成因：BASE 已带斜杠又拼 '/xxx'、或 route 变量自带前导斜杠又补 '/'）。
+//   这类条目是「用例拼接路径有 bug」的直接信号——静默归一会把症状洗掉（真实事故：'//shopping' 被洗成
+//   '/shopping' 记成已覆盖，而截图证明页面从未跳转成功），所以拒收：不计入覆盖，由调用方警告点名。
 // 无法解析返回 null。
 export function readPagesCoverageFile(file, pageNormalize = null) {
   let raw;
@@ -419,17 +428,27 @@ export function readPagesCoverageFile(file, pageNormalize = null) {
   const arr = Array.isArray(raw) ? raw : Array.isArray(raw?.pages) ? raw.pages : null;
   if (!arr) return null;
   const keys = new Set();
+  const unclean = new Set();
   for (const e of arr) {
     const rawPath = typeof e === 'string' ? e : e && typeof e === 'object' ? e.path : null;
     if (typeof rawPath !== 'string') continue;
     const p = rawPath.trim().split('?')[0];
     if (!p) continue;
     if (pageNormalize) {
+      if (p.includes('//')) {
+        unclean.add(p);
+        continue;
+      }
       const norm = pageNormalize(p);
       if (norm) keys.add(norm);
       continue;
     }
+    if (p.includes('//')) {
+      unclean.add(p);
+      continue;
+    }
     keys.add('/' + p.replace(/^\/+/, '').split('/').map(collapseSeg).join('/'));
   }
-  return keys.size ? [...keys].sort() : null;
+  if (!keys.size && !unclean.size) return null;
+  return { pages: [...keys].sort(), unclean: [...unclean].sort() };
 }

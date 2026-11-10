@@ -14,11 +14,13 @@ import { verifyArchiveIntegrity } from './integrity.js';
 import {
   validateRoute, loadRoute, saveRoute, updatePhase, approveRoute, computeNextActions,
   findRunResultPath, requireTriageForRerun, maybeCarryOverTriage, resolvePhaseId, securityCoverage,
+  consecutiveSameFingerprintFailures, mergedPhaseRuns, isFailedRun,
   canonicalizePhaseIds, injectSecurityDefaults, depthCoverage,
+  fullFlowContext, fullFlowCoverage, injectFullFlowDefaults, browserE2eMinCases, browserE2eFlowBaseline,
   summarizeRoute, summarizeCoverage,
   ROUTE_FILE,
 } from './route.js';
-import { provisionDeps, recordModification, ensureProvision, checkPlaywrightReady, loadProvision } from './provision.js';
+import { provisionDeps, recordModification, ensureProvision, checkPlaywrightReady, loadProvision, computeProvisionPlan } from './provision.js';
 import { knownStageIds } from './stages.js';
 import { execute, getExecutor, EXECUTORS } from './executors/index.js';
 import { lintSpecs, PLAYWRIGHT_TEST_RE } from './executors/playwright.js';
@@ -271,23 +273,62 @@ function browserE2eSuggested(route, root, archiveDir) {
   return detectFrontendFlag(root, archiveDir);
 }
 
+// 路线计划指纹：只取「计划字段」（scope/豁免/阶段计划），不含执行进度（status/runs/checkpoint）。
+// 用于区分「重复 approve 相同路线」（幂等）与「已批准路线带改动重新提交评审」（重新批准）。
+function planFingerprint(route) {
+  const pick = (p) => ({
+    id: p.id,
+    kind: p.kind,
+    executor: p.executor || null,
+    command: p.command || null,
+    paths: p.paths || null,
+    targets: p.targets || null,
+    config: p.config || null,
+    onFailure: p.onFailure || null,
+    steps: p.steps || null,
+  });
+  return JSON.stringify({
+    scope: route.scope || null,
+    scopeReason: route.scopeReason || null,
+    userRequest: route.userRequest || null,
+    specials: route.specials || [],
+    phases: (route.phases || []).map(pick),
+    coverageWaiver: route.coverageWaiver || null,
+    securityWaiver: route.securityWaiver || null,
+    depthWaiver: route.depthWaiver || null,
+    fullFlowWaiver: route.fullFlowWaiver || null,
+  });
+}
+
+const TERMINAL_ROUTE_STATUSES = ['completed', 'aborted', 'abandoned'];
+
 async function saveRouteTool(args) {
   const root = resolveRoot(reqStr(args, 'root'));
   const route = reqObject(args, 'route');
   const action = oneOf(optStr(args, 'action', 'save'), ['save', 'approve'], 'action');
   const ctx = getArchiveContext(root, optStr(args, 'archiveDir', ''));
 
+  // scope 缺省自动置 "full"：专家级齐全测试是本 skill 的默认契约，不依赖 LLM 自觉；
+  // 单独测某阶段必须显式 scope="targeted" + scopeReason 留痕（validateRoute 强制）。
+  if (route.scope === undefined) route.scope = 'full';
   validateRoute(route);
   // 归档内的路线固定记录项目根，避免漂移
   route.project = { ...(route.project || {}), root };
   const apiSurface = loadApiSurface(root, ctx.dir);
+  const fullFlowCtx = fullFlowContext(root, ctx.dir);
   // 落地规范（不依赖 LLM 服从性；approve 的 E_GATE 仍是兜底）：
   // 1) 阶段 id 规范化（"smoke-01" 式序号后缀 / 执行器可唯一映射的自定义 id）
   // 2) 默认安全覆盖：安全段缺口自动补齐—— sca+secrets（完全没安全段时）；
   //    API 项目且 connectivity targets 可推导基址时补 dast（内置 security-probe 全量动态探测）
+  // 3) 默认全流程覆盖：scope=full 且缺 uat（manual 阶段，无执行器）时自动补
   const normalizedIds = canonicalizePhaseIds(route);
   const securityDefaultsInjected = injectSecurityDefaults(route, apiSurface);
-  if (normalizedIds.length || securityDefaultsInjected.length) validateRoute(route);
+  const fullFlowDefaultsInjected = injectFullFlowDefaults(route);
+  if (normalizedIds.length || securityDefaultsInjected.length || fullFlowDefaultsInjected.length) validateRoute(route);
+  // 依赖计划前置：按路线执行器自动推导（如 browser-e2e → playwright npm 包），存进路线随批准摘要
+  // 一次性征得用户同意——用户批准路线=批准依赖计划；运行中 provision_deps 对计划内依赖不再发问。
+  const provisionPlan = computeProvisionPlan(route, root);
+  if (provisionPlan.length) route.provisionPlan = provisionPlan;
   if (action === 'approve') {
     if (route.status !== 'draft') {
       fail('E_GATE', `只有 draft 状态的路线可以 approve（当前 ${route.status}）。请直接保存后重新走评审。`);
@@ -304,11 +345,36 @@ async function saveRouteTool(args) {
     diskRoute = null; // 无路线或损坏 → 按首次保存处理（损坏文件被本次合法内容替换）
   }
   let alreadyApproved = false;
+  let reapproved = false;
   if (diskRoute && !resetRoute) {
+    // 收尾/终止后的路线不可再改（报告已封章）；已批准路线不可被 save 静默改写——
+    //（真实事故：approve 之后 save 塞入 6 条 coverageWaiver，3 秒后 finalize，
+    //  「豁免须先向用户确认」沦为 prose）。批准后的任何改动（含豁免/增删阶段/改命令/换 scope）
+    //  都必须先向用户说明并获确认，再以 action="approve" 重新提交完整路线重新评审。
+    if (TERMINAL_ROUTE_STATUSES.includes(diskRoute.status)) {
+      fail(
+        'E_GATE',
+        `归档路线已收尾（status=${diskRoute.status}），路线与报告已封章，不可再修改。` +
+          `做新一轮测试请 init_archive 开新归档；确要复用本归档请显式 resetRoute=true（阶段状态与执行引用清空，runs/ 文件保留并留痕）。`
+      );
+    }
+    if (diskRoute.status !== 'draft' && action === 'save') {
+      fail(
+        'E_GATE',
+        `路线已批准（status=${diskRoute.status}），save 不可覆盖已批准路线。` +
+          `改动（增删阶段/改执行器或命令/加豁免/换 scope）必须先向用户说明并获确认，再以 action="approve" 重新提交完整路线重新评审（执行记录会保留）。` +
+          `完全推倒重来才用 resetRoute=true（阶段状态与执行引用清空，runs/ 目录文件保留并记录事件）。`
+      );
+    }
     const hasProgress = (diskRoute.phases || []).some((p) => (p.runs?.length || 0) > 0) || diskRoute.status !== 'draft';
     if (hasProgress && action === 'approve') {
-      alreadyApproved = true; // 重复 approve → 幂等返回现状，不覆盖
-    } else if (hasProgress) {
+      if (planFingerprint(route) === planFingerprint(diskRoute)) {
+        alreadyApproved = true; // 重复 approve 且路线未变 → 幂等返回现状，不覆盖
+      } else {
+        reapproved = true; // 已批准路线带改动重新提交评审 → 合并执行记录后重新批准（事件留痕）
+      }
+    }
+    if (!alreadyApproved && (reapproved || (hasProgress && action === 'save'))) {
       const newIds = new Set(route.phases.map((p) => p.id));
       const droppedWithRuns = diskRoute.phases.filter((p) => !newIds.has(p.id) && (p.runs?.length || 0) > 0);
       if (droppedWithRuns.length) {
@@ -342,16 +408,31 @@ async function saveRouteTool(args) {
     if (resetRoute && diskRoute) {
       appendEvent(ctx, 'route-reset', '显式 resetRoute=true：路线被重发覆盖（阶段状态与执行引用以新路线为准；runs/ 目录文件保留）');
     }
+    if (reapproved) {
+      // 重新评审：先以 draft 落盘再走 approveRoute 全套门禁（security/depth/fullFlow 重新校验），换发新 approvedAt
+      route.status = 'draft';
+      delete route.approvedAt;
+    }
     saveRoute(ctx.dir, route);
-    finalRoute = action === 'approve' ? approveRoute(ctx.dir, { apiSurface }) : loadRoute(ctx.dir);
-    appendEvent(ctx, action === 'approve' ? 'approve' : 'save-route', `路线${action === 'approve' ? '已批准' : '已保存'}（${route.phases.length} 个阶段）`);
+    finalRoute = action === 'approve' ? approveRoute(ctx.dir, { apiSurface, fullFlowCtx }) : loadRoute(ctx.dir);
+    appendEvent(
+      ctx,
+      action === 'approve' ? (reapproved ? 're-approve' : 'approve') : 'save-route',
+      reapproved
+        ? `已批准路线带改动经用户重新确认后重新批准（${route.phases.length} 个阶段；执行记录保留）`
+        : `路线${action === 'approve' ? '已批准' : '已保存'}（${route.phases.length} 个阶段）`
+    );
   }
   const unknownStageIds = (finalRoute.phases || [])
     .map((p) => p.id)
     .filter((id) => !knownStageIds().includes(id));
   let hint =
-    '批准前必须向用户完整呈现路线：层-阶段清单（含每阶段范围 notes）、阻断语义（abort/block/ask/continue）、' +
-    '安全段包含/跳过清单（对照返回的 security 字段，不可静默裁掉）、需要安装的依赖（走 provision 同意流程）。';
+    '批准前必须向用户完整呈现路线，且以「用户请求原话」开头（逐字引用 route.userRequest，不改写）+ 范围对照（用户要什么/路线覆盖什么/多出的部分为什么）：' +
+    '层-阶段清单（含每阶段范围 notes）、阻断语义（abort/block/ask/continue）、' +
+    '安全段包含/跳过清单（对照返回的 security 字段，不可静默裁掉）、依赖安装计划（对照返回的 provisionPlan 逐项列出：装什么/为什么/装哪/带 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1；用户批准路线=批准该计划，运行中 provision_deps 对计划内依赖不再发问）。';
+  if (provisionPlan.length) {
+    hint += `依赖计划已随路线自动算出（provisionPlan，${provisionPlan.length} 项）：批准摘要必须逐项列出征得同意——依赖审批前置到路线批准一次完成，不许拖到执行阶段才首次发问；计划外的意外依赖运行时才征询。`;
+  }
   if (unknownStageIds.length) {
     hint += `非标准阶段 id：${unknownStageIds.join('、')}（自定义 id 仅用于标准目录覆盖不了的场景；能映射到标准 id 的已自动改写，见 normalizedIds）。`;
   }
@@ -381,17 +462,73 @@ async function saveRouteTool(args) {
       `API 深度基线缺口（盘点 ${depth.apiTotal} 个端点）: ${depthGaps.map((g) => g.stage).join('、')} 未纳入路线。` +
       `save 阶段仅提示；approve 时工具会拦（E_GATE），补齐这些阶段或经用户确认后写 depthWaiver。`;
   }
+  // 全流程强制集（scope=full）：条件适用的阶段缺一即拦——save 阶段提示、approve 硬拦（E_GATE 由 approveRoute 触发）。
+  // 只对「generate-and-execute + scope=full」计算与提示：targeted/generate-only 路线不走全流程门禁，
+  // 回显 baseline 或「approve 时工具会拦」只会误导。
+  const ffApplies = route.mode === 'generate-and-execute' && route.scope !== 'targeted';
+  let ff = null;
+  if (ffApplies && (action !== 'approve' || !alreadyApproved)) {
+    try {
+      ff = fullFlowCoverage(route, fullFlowCtx);
+    } catch {
+      ff = null;
+    }
+  }
+  if (ff?.missing.length) {
+    hint +=
+      `全流程强制集缺口（scope=${ff.scope}）: ${ff.missing.map((m) => m.id).join('、')} 未纳入路线。` +
+      `save 阶段仅提示；approve 时工具会拦（E_GATE）——补齐这些阶段，或经用户确认后逐项写 fullFlowWaiver 留痕（禁止为省事默认 targeted）。`;
+  }
+  // 浏览器 E2E 流程基线（scope=full + 前端）：盘点推导的必测业务流清单随响应返回，进批准摘要——
+  // 用例按清单生成、标题带 @flow:<id>，update_phase(passed) 时逐项对账。
+  let feFlowBaseline = null;
+  if (ffApplies && fullFlowCtx.frontend) {
+    try {
+      const bl = browserE2eFlowBaseline(apiSurface, fullFlowCtx.pagesTotal ?? null);
+      if (bl.flows.length) feFlowBaseline = bl;
+    } catch {
+      feFlowBaseline = null;
+    }
+  }
+  if (feFlowBaseline) {
+    hint +=
+      `浏览器 E2E 流程基线（browserE2eFlowBaseline，${feFlowBaseline.flows.length} 条必测业务流）：批准摘要逐条列出，用例按清单生成、标题带 "@flow:<id>" 标签（如 "@flow:auth"）；` +
+      `passed 时引擎逐项对账，缺流补用例或 fullFlowWaiver 留痕。`;
+  }
+  if (fullFlowDefaultsInjected.length) {
+    hint += `全流程默认覆盖已自动补齐：${fullFlowDefaultsInjected.join('、')}（manual 阶段，返回 fullFlowDefaultsInjected）；这些也必须写进批准摘要。`;
+  }
   return text({
     saved: true,
     action,
     ...(alreadyApproved
-      ? { alreadyApproved: true, note: '路线此前已批准，本次重复 approve 未做任何改动（幂等）。要修改阶段请用 resetRoute=true 重置或开新归档。' }
+      ? { alreadyApproved: true, note: '路线此前已批准，本次重复 approve 未做任何改动（幂等）。要修改阶段请先向用户确认后以 action="approve" 重新提交，或开新归档。' }
+      : {}),
+    ...(reapproved
+      ? { reapproved: true, note: '已批准路线带改动，经重新评审后重新批准（换发新 approvedAt）；执行记录已保留。' }
       : {}),
     routeStatus: finalRoute.status,
     routePath: path.join(ctx.dir, ROUTE_FILE),
     ...(normalizedIds.length ? { normalizedIds } : {}),
     ...(securityDefaultsInjected.length ? { securityDefaultsInjected } : {}),
+    ...(fullFlowDefaultsInjected.length ? { fullFlowDefaultsInjected } : {}),
+    ...(provisionPlan.length ? { provisionPlan } : {}),
     ...(suggestE2e ? { browserE2eSuggested: true } : {}),
+    ...(ff
+      ? {
+          fullFlowBaseline: {
+            scope: ff.scope,
+            required: ff.required.map((r) => r.id),
+            missing: ff.missing.map((m) => ({ id: m.id, why: m.why })),
+            waived: ff.waived,
+            inapplicable: ff.inapplicable.map((x) => ({ id: x.id, condition: x.condition })),
+            gitDirty: fullFlowCtx.gitDirty,
+            ...(fullFlowCtx.pagesTotal != null
+              ? { pagesTotal: fullFlowCtx.pagesTotal, browserE2eMinCases: browserE2eMinCases(fullFlowCtx.pagesTotal) }
+              : {}),
+          },
+        } : {}),
+    ...(feFlowBaseline ? { browserE2eFlowBaseline: { flows: feFlowBaseline.flows, minCases: feFlowBaseline.minCases } } : {}),
     ...(depth && depth.isApiProject
       ? {
           depthBaseline: {
@@ -568,7 +705,7 @@ async function runTestsTool(args) {
     if (phase.status === 'passed' || phase.status === 'skipped') {
       fail(
         'E_GATE',
-        `阶段 "${phaseId}" 已是终态 ${phase.status}，不可再执行。要重测：save_route 重新提交包含该阶段的路线（会保留执行历史），或 init_archive 开新归档；` +
+        `阶段 "${phaseId}" 已是终态 ${phase.status}，不可再执行。要重测：向用户确认后 save_route 以 action="approve" 重新提交包含该阶段的路线（重新评审，执行历史保留），或 init_archive 开新归档；` +
           `passed/skipped 是状态机终态，不能改回 in-progress。`
       );
     }
@@ -578,14 +715,34 @@ async function runTestsTool(args) {
   const carried = maybeCarryOverTriage(ctx.dir, route, phase);
   if (carried) appendEvent(ctx, 'triage-carry', `${carried.runId} 继承 ${carried.carriedFrom} 的归因（失败指纹一致）`);
   // 仍在拦截的情形：未归因且无一致指纹（新失败/修复生效）→ 必须逐次归因
-  requireTriageForRerun(phase);
-
+  requireTriageForRerun(ctx.dir, phase);
   const executorId = oneOf(
     optStr(args, 'executor', phase.executor || ''),
     ['vitest', 'jest', 'pytest', 'generic', 'health', 'sca', 'e2e', 'playwright', 'secrets', 'security-probe'],
     'executor'
   );
   const command = optStr(args, 'command', phase.command || '');
+  // 同指纹收口门禁：连续 N 轮失败且指纹完全一致（同一批用例、同样报错前缀）＝在原地打转
+  //（修了没生效/没修在重试）。达到阈值后拒绝再跑，逼着换做法或如实归因收尾——不许无限重试烧预算。
+  // 换做法放行：本次命令与失败批次不同＝已按门禁指引换命令/换脚本，直接放行；
+  // 同命令复跑（修复是否生效要等结果出来才知道）才需要逃生口 retrySameFingerprintReason（留痕进事件流）。
+  const sameFp = consecutiveSameFingerprintFailures(ctx.dir, phase);
+  const approachChanged = sameFp.command != null && command.trim() !== '' && sameFp.command !== command;
+  if (sameFp.count >= 3 && !approachChanged) {
+    const loopReason = optStr(args, 'retrySameFingerprintReason', '');
+    if (!loopReason.trim()) {
+      fail(
+        'E_GATE',
+        `阶段 "${phaseId}" 已连续 ${sameFp.count} 轮完全相同的失败（指纹 ${sameFp.fingerprint}：${sameFp.runIds.join(' → ')}）。` +
+          `同一批失败反复复跑不会自己变绿。三选一：\n` +
+          `① record_triage 落实修复（test-bug→改用例；environment→修环境），换命令/换脚本重跑会直接放行，同命令复跑传 retrySameFingerprintReason="已修复，重验一次"；\n` +
+          `② code-bug → 归因时确认缺陷并让阶段收尾（failed/blocked），缺陷清单交维护者；\n` +
+          `③ 确有理由必须原样再验证一次：传 retrySameFingerprintReason="具体理由" 强行执行，理由留痕进事件流。`
+      );
+    }
+    appendEvent(ctx, 'fingerprint-loop-override', `连续 ${sameFp.count} 轮同指纹失败后强制重跑：${loopReason.trim()}`);
+  }
+
   if (executorId === 'generic' && !command) {
     fail('E_INVALID_ARGS', 'executor="generic" 需要 command 参数（或阶段里预置 command）。');
   }
@@ -599,6 +756,21 @@ async function runTestsTool(args) {
     fail('E_INVALID_ARGS', 'executor="e2e" 需要 steps（声明式 HTTP 步骤数组，可放参数或阶段定义）。');
   }
   const timeoutMs = optNumber(args, 'timeoutMs', 300000);
+  // 超时预算提示（软提醒，不拦）：上一轮正常完成却用掉 ≥70% 预算 → 本轮撞线超时风险高
+  //（超时整轮作废、0 用例入档）。建议按上轮耗时 ×1.5 显式调大 timeoutMs。
+  const preRunAdvisories = [];
+  try {
+    const prevRuns = mergedPhaseRuns(ctx.dir, phase);
+    const lastDone = [...prevRuns].reverse().find((r) => (r.durationMs ?? 0) > 0 && !isFailedRun(r));
+    if (lastDone && lastDone.durationMs >= timeoutMs * 0.7) {
+      preRunAdvisories.push(
+        `上一轮 ${lastDone.runId} 耗时 ${Math.round(lastDone.durationMs / 1000)}s，已达本次预算 ${Math.round(timeoutMs / 1000)}s 的 ${Math.round((lastDone.durationMs / timeoutMs) * 100)}%。` +
+          `撞线超时会整轮作废（0 用例入档）——建议 timeoutMs 取上轮耗时的 1.5 倍以上（≥ ${Math.ceil((lastDone.durationMs * 1.5) / 60000)} 分钟）。`
+      );
+    }
+  } catch {
+    /* 预算提示失败不影响执行 */
+  }
   // flaky 识别：失败后自动复跑一次，复跑通过的用例标 flaky（不稳定），不按真实失败阻断
   const retryFailedOnce = optBool(args, 'retryFailedOnce', false);
   // 覆盖率：显式开关（coverage: true 才解析），默认关闭。开启时 coverageFile 缺省自动探测。
@@ -717,6 +889,12 @@ async function runTestsTool(args) {
     result.git = git;
     result.env = envFingerprint;
     result.evidenceReason = evidenceReason || null; // 证据降级/关闭的理由留痕（evidence=full 时为 null）
+    if (result.timedOut) {
+      result.warnings.push(
+        `执行超时（预算 ${Math.round(timeoutMs / 1000)}s），进程树已被终止——本 run 用例统计不完整（多为 0 用例）。` +
+          `若阶段矩阵实际需要更久，重跑时传更大的 timeoutMs（建议 ≥ ${Math.ceil((timeoutMs * 2) / 60000)} 分钟）。`
+      );
+    }
     // 覆盖收集：
     // - 端点：沙箱脚本按约定写入 TESTROUTE_COVERAGE_FILE（execute 注入的落点）；e2e 阶段直接从
     //   声明式 steps 推导。kinds 语义：脚本可显式声明（{method, path, kinds}），未声明按所在阶段
@@ -744,8 +922,18 @@ async function runTestsTool(args) {
         );
       }
     }
-    // 页面上报按页面口径归一（normalizePagePath，与盘点/豁免同一把尺，大小写敏感）
-    const pagesCovered = readPagesCoverageFile(path.join(slot.rawDir, 'pages-coverage.json'), normalizePagePath);
+    // 页面上报按页面口径归一（normalizePagePath，与盘点/豁免同一把尺，大小写敏感）。
+    // 含 "//" 的条目（拼接路径 bug 的直接信号，如 BASE 已带斜杠又拼 '/shopping'）拒收：
+    // 不计入覆盖、警告点名——静默归一会把症状洗掉（截图证明没跳转、覆盖却记满）。
+    const pagesReport = readPagesCoverageFile(path.join(slot.rawDir, 'pages-coverage.json'), normalizePagePath);
+    const pagesCovered = pagesReport?.pages ?? null;
+    if (pagesReport?.unclean?.length) {
+      result.warnings.push(
+        `页面上报含未规范路径（不计入覆盖，按缺口处理）：${pagesReport.unclean.join('、')}。` +
+          `上报值必须与页面盘点（TESTROUTE_PAGES_FILE 指向的 web-pages.json）逐字一致，不得多出/缺少前导斜杠；` +
+          `典型成因：BASE 已带斜杠又拼 '/xxx'，或 route 变量自带前导斜杠又补 '/'。修用例后重跑，否则 finalize 页面覆盖对照按缺口拦截。`
+      );
+    }
     if (pagesCovered?.length) {
       result.pageCoverage = { type: 'pages', total: pagesCovered.length, pages: pagesCovered };
     } else if (executorId === 'playwright') {
@@ -899,6 +1087,7 @@ async function runTestsTool(args) {
       ...(Array.isArray(c.attachments) && c.attachments.length ? { attachments: c.attachments } : {}),
     })),
     warnings: result.warnings,
+    ...(preRunAdvisories.length ? { budgetAdvisories: preRunAdvisories } : {}),
     retry: retryInfo,
     git,
     // 证据门禁结果（playwright 阶段）：trace/截图/video 落地统计 + 是否达标；evidence=off 时含理由
@@ -918,7 +1107,7 @@ async function runTestsTool(args) {
     ...(noCasesParsed
       ? {
           noCasesParsed: true,
-          note: '执行崩溃且解析到 0 个用例：先查 rawDir 下的 console-*.log 定位命令/环境问题；此状态 environment 归因无法放行 passed——修复后重跑，或将阶段标记 failed / skipped(reason)。',
+          note: '执行崩溃且解析到 0 个用例：先查 rawDir 下的 console-*.log 定位命令/环境问题；此状态 environment 归因无法放行 passed——修复命令/环境问题后重跑，或将阶段标记 failed / skipped(reason)。',
         }
       : {}),
     nextActions: computeNextActions(freshRoute),
@@ -1299,7 +1488,7 @@ export const TOOL_DEFS = [
   {
     name: 'testroute_save_route',
     description:
-      '校验并保存测试路线 route.json（自动规范化阶段 id；安全段缺口自动补齐：无安全段补 sca+secrets，API 项目可发包时补 dast 内置探测器）。action="approve" 表示用户已批准路线（人工检查点，不可跳过）。覆盖豁免用 route.coverageWaiver（[{endpoint|page, reason}] 逐项留痕，finalize 覆盖门禁的逐项逃生阀）。',
+      '校验并保存测试路线 route.json（自动规范化阶段 id；安全段缺口自动补齐：无安全段补 sca+secrets，API 项目可发包时补 dast 内置探测器）。route.userRequest 必填：用户对本次测试请求的原话（逐字引用，不改写、不概括）——批准摘要必须以「用户原话」开头并做范围对照（用户要什么/路线覆盖什么/多出的部分为什么），最终报告头部原样引用。action="approve" 表示用户已批准路线（人工检查点，不可跳过）；已批准路线不可 save 覆盖——任何改动（含豁免/增删阶段/改命令）须先向用户说明并获确认，再 action="approve" 重新提交重新评审；终态路线（completed/aborted/abandoned）不可改，复用须 resetRoute=true。scope 缺省 "full"=专家级全流程强制集：条件适用的阶段（unit/sast/sca/secrets/uat/connectivity/smoke/load/stress/soak/api-functional/boundary/negative/authz/business-logic/e2e/browser-e2e/compatibility/regression…）缺一 approve 即 E_GATE 硬拦，响应带 fullFlowBaseline 逐项对照；只测部分阶段必须显式 scope="targeted" 且附 scopeReason。逐项豁免用 route.fullFlowWaiver（[{phase, reason}] 留痕，须先向用户确认）；覆盖豁免用 route.coverageWaiver（[{endpoint|page, reason}]）。依赖审批前置：响应带 provisionPlan（按路线执行器自动推导，如 browser-e2e → playwright npm 包）——批准摘要必须逐项列出，用户批准路线=批准该计划；运行中 provision_deps 对计划内依赖返回 preConsented=true 不再发问，计划外依赖才征询。前端项目另带 browserE2eFlowBaseline（盘点推导的必测业务流清单：登录登出/每模块 UI CRUD/表单错误态）——批准摘要逐条列出，用例标题带 @flow:<id> 标签，passed 时逐项对账。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1308,7 +1497,7 @@ export const TOOL_DEFS = [
         action: str('可选：save（保存草稿，默认）| approve（用户已批准）'),
         route: {
           type: 'object',
-          description: '路线对象：{ schemaVersion:1, mode, status, project:{name,techStack?}, phases:[{id,kind,executor?,command?,paths?,config?,onFailure?,status,notes?}], coverageWaiver?: [{endpoint?|page?, reason}] }',
+          description: '路线对象：{ schemaVersion:1, mode, status, userRequest:"用户请求原话（逐字引用，必填）", project:{name,techStack?}, phases:[{id,kind,executor?,command?,paths?,config?,onFailure?,status,notes?}], coverageWaiver?: [{endpoint?|page?, reason}] }',
         },
       },
       required: ['root', 'route'],
@@ -1331,7 +1520,7 @@ export const TOOL_DEFS = [
   },
   {
     name: 'testroute_update_phase',
-    description: '更新阶段状态（状态机强制门禁：串行推进、execute 阶段须先跑测试才能 passed、失败按 onFailure 传播 block/ask/continue）。',
+    description: '更新阶段状态（状态机强制门禁：串行推进、execute 阶段须先跑测试才能 passed、失败按 onFailure 传播 block/ask/continue）。scope=full 时 browser-e2e 另有深度门禁：最低流程级用例数（≥max(4, ceil(页面盘点数/4), 流程基线数)）+ 必测业务流逐项对账——每条用例标题带 "@flow:<id>" 标签（清单见 save_route 响应的 browserE2eFlowBaseline：auth/crud-<module>/form-error），缺流补用例或 fullFlowWaiver 留痕。generic 执行器另有用例级结果门禁：最近一次 run 解析不出任何具名用例（只有 exit code / "Total:" 汇总行）不可 passed——沙箱脚本逐用例写 TESTROUTE_RESULTS_FILE（{name, status, message?} JSON 数组）或输出 "PASS | 用例名"/"FAIL | 用例名" 行后重跑。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1384,7 +1573,8 @@ export const TOOL_DEFS = [
         evidenceReason: { type: 'string', description: 'evidence≠full 时必填：引用 .testfile/用户的明写要求或 ffmpeg 缺失等依据，理由留痕进 run 记录与最终报告' },
         coverage: { type: 'boolean', description: '可选：显式开启覆盖率解析（默认关闭）。开启后目标项目须已产出 LCOV；建议让测试框架把覆盖率输出到沙箱内（如 vitest --coverage.reportsDirectory "<sandboxDir>/coverage"），随归档一起清理' },
         coverageFile: str('可选：LCOV 覆盖率文件（相对 root 或绝对路径）；需 coverage=true，缺省自动探测 coverage/lcov.info 与 coverage.lcov。建议指向沙箱内输出的覆盖率文件（产物随归档清理）'),
-        timeoutMs: { type: 'number', description: '可选：超时毫秒，默认 300000' },
+        timeoutMs: { type: 'number', description: '可选：超时毫秒，默认 300000。矩阵类阶段（多文件全量跑）请按上一轮实际耗时估：上轮 ≥ 预算 70% 时工具会提示调大；超时整轮作废（0 用例入档）' },
+        retrySameFingerprintReason: { type: 'string', description: '可选：连续 ≥3 轮完全相同的失败（同指纹）后的逃生口——必须给出具体理由（如"已修复，重验一次"），理由留痕进事件流。换命令/换脚本重试会直接放行，无需此参数；同命令复跑同指纹第 3 轮起必须带它' },
         pythonBin: str('可选：pytest 用的解释器，缺省自动探测'),
       },
       required: ['root', 'phaseId'],
@@ -1452,7 +1642,7 @@ export const TOOL_DEFS = [
   {
     name: 'testroute_finalize_report',
     description:
-      '汇总路线、执行记录与 triage，生成 final-report.md（含改动与卸载说明、缺陷 P0–P3 分级）。任务收尾必调；草稿路线 finalize 标记 abandoned。门禁：code-bug 缺优先级、API 覆盖矩阵有缺口（functional/authz 恒拦；negative/boundary 在对应阶段未跳过时拦）、页面覆盖有缺口（有 browser-e2e 且盘点 ≥5 页时拦）——个别端点/页面确实测不了走 route.coverageWaiver 逐项留痕。',
+      '汇总路线、执行记录与 triage，生成 final-report.md（含改动与卸载说明、缺陷 P0–P3 分级）。任务收尾必调；草稿路线 finalize 标记 abandoned。门禁：code-bug 缺优先级、API 覆盖矩阵有缺口（functional/authz 恒拦；negative/boundary 在对应阶段未跳过时拦）、页面覆盖有缺口（有 browser-e2e 且盘点 ≥5 页时拦）——个别端点/页面确实测不了走 route.coverageWaiver 逐项留痕。scope=full 的报告另含「全流程完整性对照」段：强制集逐项对账（纳入/跳过/豁免/缺失无处遁形）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1469,7 +1659,7 @@ export const TOOL_DEFS = [
   },
   {
     name: 'testroute_provision_deps',
-    description: '为被测项目安装测试依赖（默认 playwright），带同意检查点：不带 confirm 返回安装计划，用户同意后 confirm=true 执行；已就绪则直接 ready。浏览器按「编辑器内置（CDP 附着）> 系统 Chrome/Edge > chromium 缓存 > 下载（永远最后）」优先级获取，不随包下载。安装记入 provision.json 台账。',
+    description: '为被测项目安装测试依赖（默认 playwright），带同意检查点：不带 confirm 返回安装计划，用户同意后 confirm=true 执行；已就绪则直接 ready。响应带 preConsented：true=该依赖已随路线批准（route.provisionPlan，批准摘要已征得用户同意）——展示计划留痕后直接 confirm=true，不再发问；false=计划外依赖，须先向用户征得同意。浏览器按「编辑器内置（CDP 附着）> 系统 Chrome/Edge > chromium 缓存 > 下载（永远最后）」优先级获取，不随包下载。安装记入 provision.json 台账。',
     inputSchema: {
       type: 'object',
       properties: {

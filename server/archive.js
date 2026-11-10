@@ -3,6 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fail, truncate } from './validate.js';
+import { engineIdentity, engineLabel } from './version.js';
 import {
   ensureDir,
   nowIso,
@@ -18,7 +19,7 @@ import {
   toPosix,
   resolveDottedModulePath,
 } from './paths.js';
-import { loadRoute, saveRoute, findRunResultPath, securityCoverage, ROUTE_FILE } from './route.js';
+import { loadRoute, saveRoute, findRunResultPath, securityCoverage, fullFlowContext, fullFlowCoverage, browserE2eMinCases, mergedPhaseRuns, maybeCarryOverTriage, isFailedRun, ROUTE_FILE } from './route.js';
 import { failureFingerprint } from './result.js';
 import { loadProvision, buildUninstallBlock, detectWorkspaceChanges, recordModification } from './provision.js';
 import { snapshotTestGate, verifyTestGate, acknowledgeTestGate, gateViolationError } from './testgate.js';
@@ -259,7 +260,8 @@ export function initArchive(root, { label = '', gitignore = false } = {}) {
     createdAt: nowIso(),
     projectRoot: root,
     testGateFiles: gateFileCount,
-    events: [{ at: nowIso(), type: 'init', detail: `归档目录已创建（测试脚本只读基线 ${gateFileCount} 个文件）${testfileNote}` }],
+    engine: engineIdentity(),
+    events: [{ at: nowIso(), type: 'init', detail: `归档目录已创建（测试脚本只读基线 ${gateFileCount} 个文件）${testfileNote}｜引擎 ${engineLabel()}` }],
   };
   writeJson(path.join(dir, MANIFEST_FILE), manifest);
 
@@ -469,18 +471,47 @@ export function finalizeReport(archiveDir, { acknowledgeTestFileChanges = false 
   const route = loadRoute(archiveDir);
   const { manifest } = { manifest: readJson(path.join(archiveDir, MANIFEST_FILE)) || {} };
 
-  // 缺陷优先级门禁：code-bug 归因必须划 P0–P3，否则拒绝出报告（报告的核心交付物之一）
+  // route-reset 会清 phase.runs 但保留 runs/ 目录——执行历史的权威来源是磁盘。报告统计前先把
+  // 磁盘 run 合并回各阶段（按 runId 去重、按时间排序）并尝试同指纹归因继承：否则 reset 一次，
+  // 报告就丢失此前全部失败归因与执行计数（真实案例：10 次 run 的归档，报告只统计 reset 后 1 次）。
+  for (const p of route.phases) {
+    const carried = maybeCarryOverTriage(archiveDir, route, p);
+    if (carried) {
+      appendEvent(archiveDir, 'triage-carry', `${carried.runId} finalize 时继承 ${carried.carriedFrom} 的归因（失败指纹一致）`);
+    }
+    p.runs = mergedPhaseRuns(archiveDir, p);
+  }
+
+  // 收尾门禁：任一阶段最近一次执行是失败且未归因 → 拒绝出报告。没有这道门，reset 后未归因的
+  // 失败会静默从报告里消失（真实案例：reset 后失败 run 未归因，报告只字未提）。历史失败已被
+  // 同指纹继承归因（上方 carry）或被后续通过的 run 收口的不拦——只拦"未收口且未归因"。
+  for (const p of route.phases) {
+    const runs = Array.isArray(p.runs) ? p.runs : [];
+    const last = runs[runs.length - 1];
+    if (last && isFailedRun(last) && !last.triage) {
+      fail(
+        'E_TRIAGE_REQUIRED',
+        `阶段 "${p.id}" 最近一次执行（${last.runId}）失败且未归因，无法生成最终报告。` +
+          `请先 record_triage(runId="${last.runId}") 逐条归因（test-bug→修用例重跑；code-bug→标记 failed 并划优先级；environment→修复环境后重跑）。`
+      );
+    }
+  }
+
+  // 缺陷优先级门禁：code-bug 归因必须划 P0–P3，否则拒绝出报告（报告的核心交付物之一）。
+  // 同一用例被多轮 triage/继承重复归因时以最近一次为准（按 caseId 去重）——缺陷清单按缺陷计数，
+  // 不按归因轮次计数，否则 P1×2 会被继承链放大成 P1×6。
   const PRIORITIES = ['P0', 'P1', 'P2', 'P3'];
-  const bugItems = [];
+  const bugByCase = new Map();
   for (const p of route.phases) {
     for (const run of p.runs || []) {
       for (const c of run.triage?.classifications || []) {
         if (c.classification === 'code-bug') {
-          bugItems.push({ phaseId: p.id, runId: run.runId, caseId: c.caseId, priority: c.priority || null, note: c.note || '' });
+          bugByCase.set(c.caseId, { phaseId: p.id, runId: run.runId, caseId: c.caseId, priority: c.priority || null, note: c.note || '' });
         }
       }
     }
   }
+  const bugItems = [...bugByCase.values()];
   const missingPriority = bugItems.filter((b) => !b.priority);
   if (missingPriority.length) {
     fail(
@@ -651,6 +682,22 @@ export function finalizeReport(archiveDir, { acknowledgeTestFileChanges = false 
     );
   }
 
+  // 全流程完整性对照（scope=full）：强制集逐项对账——纳入/状态/run 数/豁免，报告里无处遁形。
+  // finalize 时重判条件（运行中可能变化，如 provisioning 触发 gitDirty → regression 成为必需）；
+  // 有缺口不拦 finalize（诚实原则优先：aborted/incomplete 本就不宣称完成），但缺什么必须写出来。
+  const fullFlowApplies = route.scope === 'full' && route.mode === 'generate-and-execute';
+  let ffCov = null;
+  let ffCtx = null;
+  if (fullFlowApplies && route.project?.root) {
+    try {
+      ffCtx = fullFlowContext(route.project.root, archiveDir);
+      ffCov = fullFlowCoverage(route, ffCtx);
+    } catch {
+      ffCov = null;
+      ffCtx = null;
+    }
+  }
+
   // 只读门禁：项目自有测试脚本在归档创建后被修改/删除 → 拒绝出报告（用户知情确认后可重建基线）
   const gateRoot = route.project?.root;
   let changesBlock = '';
@@ -754,10 +801,15 @@ export function finalizeReport(archiveDir, { acknowledgeTestFileChanges = false 
     lines.push(`- 终止: 阶段 **${route.terminated.byPhase}** 于 ${route.terminated.at} 终止全链路（${route.terminated.reason}）`);
   }
   lines.push(`- 生成时间: ${manifest.createdAt || '-'} | 报告时间: ${route.completedAt}`);
+  lines.push(`- 引擎: ${engineLabel()}`);
+  if (route.userRequest) lines.push(`- 用户请求（原话）: 「${route.userRequest.trim()}」`);
+  lines.push(
+    `- 范围: scope=${route.scope === 'targeted' ? `targeted${route.scopeReason ? `（${route.scopeReason}）` : ''}` : 'full（全流程默认契约，超出用户点名范围的部分由标准链路补齐）'} · 阶段 ${(route.phases || []).length} 个: ${(route.phases || []).map((p) => p.id).join('、')}`
+  );
   if (route.project?.techStack) lines.push(`- 技术栈: ${route.project.techStack}`);
   if (bugItems.length) lines.push(`- 缺陷优先级: ${prioSummary}（P0=阻断级，最高优先修复；分级标准见「缺陷优先级」段）`);
   if (apiInv?.total >= 5) {
-    // 头条口径与矩阵一致（矩阵是权威）；loose-match 的 hit.size 会因盘点内近重复键（尾斜杠/同名参数两种写法）少计
+    // 头条口径与矩阵一致（矩阵是权威；coverageAgainstInventory 同样按盘点条目计数，两处数字必须能对上）
     const funcCovered = matrix ? matrix.byKind.functional.covered : apiCmp ? apiCmp.covered : 0;
     const funcPct = matrix ? Math.round((funcCovered / Math.max(1, apiInv.total)) * 1000) / 10 : apiCmp ? apiCmp.pct : null;
     lines.push(
@@ -771,6 +823,16 @@ export function finalizeReport(archiveDir, { acknowledgeTestFileChanges = false 
   }
   if (pageGateApplies) {
     lines.push(`- 页面覆盖: ${webInv.total - pageGaps.length - pageWaivedItems.length}/${webInv.total} 页面实测访问过${pageWaivedItems.length ? `（另豁免 ${pageWaivedItems.length}）` : ''}（见「页面覆盖对照」段）`);
+  }
+  if (ffCov) {
+    const ffBits = [];
+    if (ffCov.missing.length) ffBits.push(`缺 ${ffCov.missing.map((m) => m.id).join('、')}`);
+    if (ffCov.waived.length) ffBits.push(`豁免 ${ffCov.waived.map((w) => w.id).join('、')}`);
+    if (ffCov.skipped.length) ffBits.push(`跳过 ${ffCov.skipped.map((s) => s.id).join('、')}`);
+    lines.push(
+      `- 全流程完整性: scope=full 必需阶段 ${ffCov.counts.present}/${ffCov.counts.required} 纳入` +
+        (ffBits.length ? `（${ffBits.join('；')}，见「全流程完整性对照」段）` : '（见「全流程完整性对照」段）')
+    );
   }
   lines.push('');
   if (changesBlock) {
@@ -788,7 +850,7 @@ export function finalizeReport(archiveDir, { acknowledgeTestFileChanges = false 
       : outcome === 'with-issues'
         ? '存在失败或阻断：打开下方「失败与归因」表逐条处理——test-bug→修复用例后重跑；code-bug→**TestRoute 只测不修**，由项目维护者按「缺陷优先级」段（P0 最先）修复业务代码后返工重跑（TestRoute 绝不为让测试通过去改代码或改测试）；environment→修复环境后重跑（全部失败归因 environment 时工具允许放行）。'
         : outcome === 'aborted'
-          ? '准入链路已终止（连通性/冒烟失败）：先修复服务或环境，再把终止阶段 update_phase 回 in-progress 解除终止，然后重跑。'
+          ? '准入链路已终止（连通性/冒烟失败）：缺陷已在「失败与归因」表记录划级（TestRoute 只测不修）；由项目维护者修复服务问题后，再把终止阶段 update_phase 回 in-progress 解除终止并重跑验证。'
           : outcome === 'planned-only'
             ? '仅生成模式：全部用例已生成并归档，但未执行。可切换 generate-and-execute 模式执行，或人工执行 manual-cases/ 里的清单。'
             : '链路未走完：用 get_route 查看 nextActions，从断点继续推进（阶段 notes 里有 checkpoint）。'
@@ -871,6 +933,69 @@ export function finalizeReport(archiveDir, { acknowledgeTestFileChanges = false 
     }
   }
   lines.push('');
+  // 全流程完整性对照（scope=full）：强制集逐项对账——批准门禁拦的是 save/approve 时点，
+  // 运行中条件会变（如 provisioning 触发 git-dirty）、阶段也可能中途被 skipped；finalize 如实对账。
+  if (ffCov) {
+    lines.push(`## 全流程完整性对照（scope=full）`);
+    lines.push('');
+    lines.push(
+      `全流程（scope=full）的强制集由引擎逐项判定：条件适用的阶段必须纳入，条件不满足的自动不要求（下表「不要求」行），` +
+        `resilience/chaos/pentest/canary/dast 等保持 opt-in。`
+    );
+    lines.push('');
+    lines.push(`| 阶段 | 层 | 纳入原因 | 状态 | 执行次数 | 说明 |`);
+    lines.push(`| --- | --- | --- | --- | --- | --- |`);
+    for (const r of ffCov.required) {
+      const p = route.phases.find((x) => x.id === r.id);
+      if (p) {
+        const last = Array.isArray(p.runs) && p.runs.length ? p.runs[p.runs.length - 1] : null;
+        const s = last?.summary;
+        const note =
+          p.status === 'skipped'
+            ? `skipped: ${mdCell(p.reason || '（未给理由）')}`
+            : s
+              ? `${s.passed ?? 0} 过 / ${s.failed ?? 0} 败 / ${s.skipped ?? 0} 跳`
+              : '-';
+        lines.push(`| ${r.id} | ${r.group} | ${mdCell(r.why)} | ${p.status} | ${p.runs?.length || 0} | ${note} |`);
+      } else {
+        const w = ffCov.waived.find((x) => x.id === r.id);
+        lines.push(`| ${r.id} | ${r.group} | ${mdCell(r.why)} | 未纳入 | 0 | ${w ? `豁免: ${mdCell(w.reason)}` : '**缺失（未豁免）**'} |`);
+      }
+    }
+    lines.push('');
+    if (ffCtx?.pagesTotal != null && route.phases.some((p) => p.id === 'browser-e2e' && p.status !== 'skipped' && !ffCov.waived.some((w) => w.id === 'browser-e2e'))) {
+      const b = route.phases.find((p) => p.id === 'browser-e2e');
+      const lastB = Array.isArray(b.runs) && b.runs.length ? b.runs[b.runs.length - 1] : null;
+      const caseTotal = lastB?.summary?.total;
+      const min = browserE2eMinCases(ffCtx.pagesTotal);
+      lines.push(
+        `- 浏览器 E2E 流程级用例: ${Number.isFinite(caseTotal) ? caseTotal : 0}/${min} 条（页面盘点 ${ffCtx.pagesTotal} 页 → max(4, ceil(${ffCtx.pagesTotal}/4))；每条覆盖一个完整业务流，页面走查最多算 1 条）`
+      );
+      lines.push('');
+    }
+    if (ffCov.skipped.length) {
+      lines.push(
+        `**注意**：必需阶段 ${ffCov.skipped.map((s) => s.id).join('、')} 以 skipped 放行（理由见上表与「阶段备注与检查点」）——结论不含这些阶段，不是完整全流程。`
+      );
+      lines.push('');
+    }
+    if (ffCov.missing.length) {
+      lines.push(
+        `**缺失（未豁免）**：${ffCov.missing.map((m) => m.id).join('、')}——批准后被裁剪，或条件在运行中变化（如依赖安装触发 git-dirty 使 regression 成为必需）。报告如实呈现；此状态不构成完整的全流程测试。`
+      );
+      lines.push('');
+    }
+    if (ffCov.waived.length) {
+      lines.push(`豁免均逐项留痕（fullFlowWaiver，理由见上表），豁免是经用户确认的例外，不是删除。`);
+      lines.push('');
+    }
+    if (ffCov.inapplicable.length) {
+      lines.push(`条件不满足、本次不要求: ${ffCov.inapplicable.map((x) => `${x.id}（${x.condition}）`).join('、')}。`);
+      lines.push('');
+    }
+    lines.push(`保持 opt-in（本次未纳入不拦报告，需要时显式加进路线）: ${ffCov.optional.join('、')}。`);
+    lines.push('');
+  }
   if (bugItems.length) {
     lines.push(`## 缺陷优先级（P0 → P3）`);
     lines.push('');

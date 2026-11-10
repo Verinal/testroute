@@ -14,6 +14,7 @@ import { e2e } from './e2e.js';
 import { playwright, verifyEvidenceGate } from './playwright.js';
 import { secrets } from './secrets.js';
 import { securityProbe } from './securityprobe.js';
+import { engineIdentity } from '../version.js';
 
 export const EXECUTORS = {
   vitest,
@@ -98,6 +99,9 @@ export async function execute({
     }
     // 页面覆盖上报落点：browser-e2e 用例把实际访问过的页面路由写入（JSON 数组，"/login" 或 {path}）
     env.TESTROUTE_PAGES_COVERAGE_FILE = path.join(outDir, 'pages-coverage.json');
+    // 逐用例结果上报落点：generic 脚本把每个用例的 {name, status, message?} 写入（JSON 数组）——
+    // 只打汇总行/只有 exit code 的 run 没有用例级结果，update_phase 标 passed 会被门禁拦下
+    env.TESTROUTE_RESULTS_FILE = path.join(outDir, 'case-results.json');
     // 约定资料夹 .testfile/（仅根目录生效）：存在时暴露绝对路径给沙箱脚本只读取用
     try {
       if (fs.statSync(path.join(root, '.testfile')).isDirectory()) {
@@ -129,6 +133,7 @@ export async function execute({
 
   const result = {
     schemaVersion: 1,
+    engine: engineIdentity(), // 版本锚：这份 result.json 由哪个版本/哪次构建的引擎产出
     runId: null, // writeRun 时回填
     phaseId: null, // 调用方回填
     executor: executorId,

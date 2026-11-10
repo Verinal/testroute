@@ -82,3 +82,28 @@ export function changedFiles(root) {
     summary,
   };
 }
+
+// 全流程门禁用（scope=full 的 regression 纳入判定）：工作区是否存在「真实源码变更」。
+// 不走 changedFiles（items 截断 50 条，截断后无法可靠判定），直接全量 porcelain 逐行核对：
+// untracked（??）不计（测试产物/归档随时新增，不代表源码被改）；
+// 排除 test-archives/** 与 exclude 列表（provision 台账记录的安装/改动路径——playwright 安装自己触发的假阳性）。
+export function hasTrackedChanges(root, exclude = []) {
+  if (!isGitRepo(root)) return false;
+  const status = git(root, ['status', '--porcelain=v1']);
+  if (status.status !== 0) return false;
+  const excl = new Set(exclude.map((p) => String(p)));
+  for (const line of String(status.stdout).split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const x = line[0];
+    const y = line[1];
+    if (x === '?' || y === '?') continue;
+    let rest = line.slice(3);
+    const rename = /^[^ ]+ -> (.*)$/.exec(rest);
+    if (rename) rest = rename[1];
+    const p = rest.replace(/^"|"$/g, '');
+    if (excl.has(p)) continue;
+    if (p === 'test-archives' || p.startsWith('test-archives/')) continue;
+    return true;
+  }
+  return false;
+}
